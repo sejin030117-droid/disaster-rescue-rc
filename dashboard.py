@@ -195,7 +195,7 @@ class FrameGrabber:
 #  통합 소스 (시뮬레이션 맵 + 카메라 스레드)
 # ═══════════════════════════════════════════════════════════════
 class SimSource:
-    def __init__(self, state: RobotState, seed=11, live_cam=False):
+    def __init__(self, state: RobotState, seed=31, live_cam=False):
         import sim_bridge as B
         self.B = B
         self.s = state

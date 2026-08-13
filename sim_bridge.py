@@ -213,20 +213,26 @@ class DashViz:
     grid_n = 12           # 대시보드 히트맵 격자 크기
     min_interval_s = 0.08  # ★ 이 이상 빠르게는 갱신 안 함 (대략 12Hz 상한)
     RESCUE_REPLAN_EVERY = 5   # 요구조자 발견 후 이 스텝마다 경로 재계산
-    FIRE_CIRCLE_TEMP_C = 40.0  # ★불(원) 표시 전용 임계값.
-                               #   [실측 수정] 예전 80도는 f_temp ScalarField
-                               #   의 peak=68.0 보다 높아 원리적으로 절대
-                               #   도달 불가능한 값이었다(시드 133에서
-                               #   "온도 높은데 fire로 안 뜸" 리포트로 발견).
-                               #   40도로 낮춰서 MetricCard 의 온도 경계(warn)
-                               #   임계값과도 맞췄다 - 대시보드 좌하단 "온도"
-                               #   카드가 "경계"로 바뀌는 시점과 지도에 불
-                               #   원이 뜨는 시점이 이제 일치한다.
-                               #   rescue_planner.py 의 경로계획 임계값(50도)
-                               #   과는 여전히 다르다 - 그쪽은 "얼마나
-                               #   뜨거우면 실제로 우회할지"이고 이건
-                               #   "얼마나 뜨거우면 지도에 강조 표시할지"라
-                               #   서로 다른 질문이다.
+    FIRE_CIRCLE_TEMP_C = 50.0  # ★불(원) 표시 임계값.
+                               #   [근거] 맨몸 인간 기준 - 습도 낮은 공기는
+                               #   짧은 시간이면 고온도 버티지만(사우나
+                               #   80~100도/10~20분), 그건 "탈출 가능+휴식"
+                               #   전제다. 지속 노출·부상·탈수가 겹치면
+                               #   훨씬 낮은 온도에서도 위험해진다. 산업
+                               #   열스트레스 기준(WBGT)은 습도 반영 시
+                               #   32~34도부터 위험 취급 - 요구조자는
+                               #   스스로 못 움직일 수 있으니 그보다 보수적
+                               #   으로, "건강한 사람도 짧게만 버티고 부상자
+                               #   면 명백히 위험한" 50도로 잡았다.
+                               #   [설계] rescue_planner.FIRE_TEMP_C(경로
+                               #   회피 임계값)와 값을 맞췄다 - 카드 "위험"
+                               #   표시 / 지도 화재원 / 실제 경로 회피가
+                               #   전부 50도에서 함께 발동한다. 예전엔 이
+                               #   값(당시 40도, 그 전엔 80도)이 회피
+                               #   임계값과 따로 놀았는데, 그럴 이유가
+                               #   딱히 없어서 통일했다 - 바꾸려면 여기와
+                               #   rescue_planner.py, 그리고 아래 dashboard.py
+                               #   의 온도 카드 danger 임계값을 같이 바꿀 것.
 
     def __init__(self, seed):
         import path_planner_sim2 as S
@@ -239,6 +245,7 @@ class DashViz:
         # 요구조자는 이제 path_planner_sim2.rescuee_truth 가 정한다(정답).
         # 여기서는 마지막으로 경로를 다시 계산한 스텝만 추적한다.
         self._rescue_last_plan_step = -10 ** 9
+        self._rescue_error_shown = False   # 계산 오류 경고를 한 번만 찍기 위한 플래그
         n = S.GRID_SIZE
         self.f_temp = ScalarField(n, base=24.0, peak=68.0, n_src=2,
                                   sigma=8.0, seed=seed)
@@ -260,6 +267,22 @@ class DashViz:
             return
         self._last_update = time.perf_counter()
 
+        # [방어] progress() 는 S.run() 메인 루프 안에서 매 스텝 호출된다.
+        # 여기(대시보드 어댑터 계층)에서 예외가 새면 S.run() 전체가 죽고
+        # (_start_sim2._run() 이 잡아서 프린트만 하고 조용히 끝남), 그 뒤로
+        # 어떤 갱신도 안 와서 화면이 멈춘 것처럼 보인다 - 실제로 이런
+        # 사고가 났었다(rescue_planner.py 구버전 파일 문제로 progress()
+        # 안에서 AttributeError 발생 -> 요구조자 발견 직후 멈춤). 원인이
+        # 뭐든 이 어댑터 계층의 버그 하나가 핵심 시뮬레이션(탐사/지도작성)
+        # 을 멈추게 해선 안 되므로, 실제 갱신 로직은 _progress_impl 로
+        # 빼고 여기서 예외를 잡아 로그만 남긴다.
+        try:
+            self._progress_impl(target, frontiers, cleanup_phase)
+        except Exception as e:                        # noqa: BLE001
+            print(f"[DashViz] progress 갱신 중 오류 - 이번 프레임은 "
+                  f"건너뜀(시뮬레이션은 계속됨): {type(e).__name__}: {e}")
+
+    def _progress_impl(self, target, frontiers, cleanup_phase):
         S, st = self.S, self.state
         rx, ry = S.robot_x, S.robot_y
         self.trail.append((rx, ry))
@@ -349,7 +372,7 @@ class DashViz:
           그린다.
 
         ★불: 사용자 요청으로 여러 개 대신 '원 하나'만 그린다. 임계값은
-          FIRE_CIRCLE_TEMP_C(40도, 클래스 상단 정의 참고) - 온도가
+          FIRE_CIRCLE_TEMP_C(50도, 클래스 상단 정의 참고) - 온도가
           FIRE_CIRCLE_TEMP_C 이상인 실측 지점을 전부 모아 그 중심 +
           최대거리로 하나의 원을 만든다. 핫스팟이 지도 위 여러 군데
           떨어져 있어도 원은 하나뿐이라, 그 사이 안 뜨거운 영역까지 원
@@ -386,12 +409,17 @@ class DashViz:
 
     def final(self):
         S, st = self.S, self.state
-        st.map_image = render_grid(S.grid, robot=(S.robot_x, S.robot_y),
-                                   scale=self.scale, trail=self.trail)
+        try:
+            st.map_image = render_grid(S.grid, robot=(S.robot_x, S.robot_y),
+                                       scale=self.scale, trail=self.trail)
+        except Exception as e:                        # noqa: BLE001
+            print(f"[DashViz] final 렌더 중 오류(무시하고 계속): "
+                  f"{type(e).__name__}: {e}")
         st.phase = "done"
         # 미션 종료 시점의 완전한 grid/측정 데이터로 마지막 한 번 더
         # 갱신한다 - 중간 갱신 주기(RESCUE_REPLAN_EVERY)에 걸려 최신이
-        # 아닐 수 있는 경로를 최종 상태로 맞춘다.
+        # 아닐 수 있는 경로를 최종 상태로 맞춘다. (_update_rescue_paths
+        # 자체도 내부에서 예외를 잡으므로 여기선 따로 안 감싼다.)
         if S.rescuee_discovered:
             self._update_rescue_paths()
 
@@ -401,13 +429,32 @@ class DashViz:
         (실제로 밟은 칸의 실측값)만 쓴다 - f_temp/f_gas.value_at() 은
         로봇이 모르는 '정답'이라 여기서 참조하면 안 된다
         (rescue_planner.py 상단 docstring, path_planner_sim2.py 의
-        정답/로봇로직 분리 원칙과 동일한 이유)."""
+        정답/로봇로직 분리 원칙과 동일한 이유).
+
+        [방어] 이 함수는 S.run() 메인 루프와 같은 스레드에서 progress()를
+        통해 호출된다. 여기서 예외가 새면 S.run() 전체가 죽고(_start_sim2
+        의 _run() 이 잡아서 프린트만 하고 조용히 끝남), 그 뒤로 그 어떤
+        갱신도 안 와서 화면이 그대로 멈춘 것처럼 보인다 - 실제로
+        rescue_planner.py 구버전(plan_rescue_paths 이전 이름)이 로컬에
+        남아있어서 이 증상이 났었다. 원인이 뭐든(구버전 파일, 새 버그 등)
+        구조경로 계산 하나가 미션 전체를 멈추게 하면 안 되므로, 여기서
+        예외를 잡아 로그만 남기고 다음 스텝을 계속 진행한다. 경고는
+        RESCUE_REPLAN_EVERY 마다 계속 재시도되므로, 매번 다 찍으면 로그가
+        같은 줄로 도배된다 - 처음 한 번만 출력한다."""
         import rescue_planner as RP
         S, st = self.S, self.state
         if S.rescuee_truth is None:
             return
-        path_safe, path_risky = RP.plan_rescue_paths(
-            S.grid, self.measured_t, self.measured_g, S.home, S.rescuee_truth)
+        try:
+            path_safe, path_risky = RP.plan_rescue_paths(
+                S.grid, self.measured_t, self.measured_g, S.home, S.rescuee_truth)
+        except Exception as e:                      # noqa: BLE001
+            if not self._rescue_error_shown:
+                self._rescue_error_shown = True
+                print(f"[구조경로] 계산 중 오류 - 이후 계속 건너뜀(재계산은 "
+                      f"계속 시도됨, 로그는 이번만 출력): "
+                      f"{type(e).__name__}: {e}")
+            return
         st.rescue_path_safe = path_safe or []
         st.rescue_path_risky = path_risky or []
 

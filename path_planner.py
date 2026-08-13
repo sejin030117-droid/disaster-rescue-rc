@@ -2,6 +2,8 @@
 import heapq
 import math
 
+import numpy as np
+
 GRID_SIZE = 60
 CELL_SIZE = 0.05
 ROBOT_SIZE_M = 0.25
@@ -144,16 +146,37 @@ def can_move_diagonal(grid, x, y, nx, ny):
 
 
 def find_frontiers(grid):
-    frontiers = []
-    for y in range(GRID_SIZE):
-        for x in range(GRID_SIZE):
-            if grid[y][x] == 0:
-                for nx, ny in get_neighbors(x, y):
-                    if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
-                        if grid[ny][nx] == -1:
-                            frontiers.append((x, y))
-                            break
-    return frontiers
+    """빈공간(0) 중 미탐색(-1)과 8방향으로 맞닿은 칸 = 다음 탐사 목표 후보.
+
+    ★성능: 예전엔 60x60 전 칸을 파이썬 이중루프로 훑으며 칸마다 이웃 8개를
+      다시 확인했다(실측 376콜/3.4초). 매 스텝 호출되는 함수라 numpy 로
+      벡터화했다 - 미탐색 마스크를 8방향으로 한 칸씩 밀어(shift) OR 누적하면
+      '미탐색과 인접' 마스크가 한 번에 나온다.
+
+    ★ 반환 순서는 예전과 동일하다(y 오름차순, 같은 y 안에서 x 오름차순).
+      np.where 가 row-major 로 반환하는 순서가 원래 이중루프(y 바깥/x 안쪽)와
+      같다. 호출부가 min(...) 으로 최소를 고를 때 동점 처리가 순서에 의존하므로
+      이게 어긋나면 탐사 경로가 미묘하게 달라진다.
+
+    ★ 경계 밖 이웃은 '미탐색 아님'으로 친다 - 밀어낸 자리를 False 로 채우면
+      원래 코드의 범위검사(0 <= nx < GRID_SIZE ...)와 결과가 같다."""
+    g = np.asarray(grid)
+    unk = (g == -1)
+    near_unk = np.zeros_like(unk)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            sh = np.zeros_like(unk)
+            # (dy, dx) 만큼 밀어서 겹치는 부분만 복사 (바깥은 False 유지)
+            ys_dst = slice(max(0, dy), GRID_SIZE + min(0, dy))
+            xs_dst = slice(max(0, dx), GRID_SIZE + min(0, dx))
+            ys_src = slice(max(0, -dy), GRID_SIZE + min(0, -dy))
+            xs_src = slice(max(0, -dx), GRID_SIZE + min(0, -dx))
+            sh[ys_dst, xs_dst] = unk[ys_src, xs_src]
+            near_unk |= sh
+    ys, xs = np.where((g == 0) & near_unk)
+    return list(zip(xs.tolist(), ys.tolist()))
 
 
 def find_path(grid, start, goal):

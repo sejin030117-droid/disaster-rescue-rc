@@ -30,19 +30,20 @@ rescue_planner.py -- 요구조자 구출을 위한 해저드 인식 경로 탐�
   각각 None 일 수 있다(그 조건으로는 경로가 아예 없음).
 
   판정 임계값(FIRE_TEMP_C=50, GAS_PPM=40)은 sim_bridge.DashViz._hazards() 의
-  가스 위험구역 판정 기준과 동일하게 맞췄다. ★단, 화재(불) 표시 자체는
-  sim_bridge 쪽에서 시각적 강조를 위해 더 낮은 40도 기준의 별도 원으로
-  그리므로(사용자 요청 - 온도 40도부터 "높다"고 표시), 이 경로계획
-  임계값(50도)과 화면에 그려지는 '불 원'의 기준이 다르다 - 40~50도 구간은
-  지도에 불 원이 뜨지만(경계 강조) 경로는 아직 그 구간을 막지 않는다는
-  뜻이다(50도부터 실제로 우회). "얼마나 뜨거우면 강조 표시할지"와
-  "얼마나 뜨거우면 실제로 피할지"는 다른 질문이라 의도적으로 분리했다.
-  둘을 통일하고 싶으면 여기와 sim_bridge.py 의 FIRE_CIRCLE_TEMP_C 를
-  함께 바꿀 것.
+  가스 위험구역 판정 기준과 동일하게 맞췄다. 화재(불) 표시(지도의 원)도
+  같은 50도를 쓴다(sim_bridge.FIRE_CIRCLE_TEMP_C) - 맨몸 인간이 짧게라도
+  버티기 애매해지는 지점을 기준으로 잡았다(근거는 sim_bridge.py 주석
+  참고). 카드 "위험" 표시 / 지도 화재원 / 실제 경로 회피가 전부 50도에서
+  함께 발동한다 - 셋을 다르게 두면 "지도엔 안 뜨는데 왜 이 경로를
+  피하지?" 같은 혼란이 생긴다. 값을 바꿀 때는 여기, sim_bridge.py 의
+  FIRE_CIRCLE_TEMP_C, dashboard.py 의 온도 카드 danger 임계값 셋을 같이
+  바꿀 것(단일 출처가 세 곳에 따로 적혀 있는 상태라 하나만 바꾸면
+  어긋난다 - robot_config.py 스타일의 진짜 단일 상수 모듈로 옮기는 게
+  더 안전할 수 있다).
 """
 import path_planner as P
 
-FIRE_TEMP_C = 50.0      # sim_bridge.DashViz._hazards() 의 가스/온도 위험 판정과 동일
+FIRE_TEMP_C = 50.0      # sim_bridge.DashViz._hazards() / FIRE_CIRCLE_TEMP_C 와 동일
 GAS_PPM = 40.0
 
 

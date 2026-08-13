@@ -1123,6 +1123,35 @@ def _build_move_table():
 MOVE_TABLE = _build_move_table()
 
 
+def _build_turn_diff_table():
+    """MOVE_TABLE 의 이동방향 i -> j 로 바뀔 때의 '90도 단위 회전량'을
+    미리 계산해둔다.  ★성능 최적화
+
+    [왜 필요한가 - 실측 프로파일]
+      turn_penalty() 가 전체 실행시간의 31%(60초 중 18.7초)를 먹고 있었다.
+      bfs_from 의 간선 완화마다 호출되어 1,190만 번 돌았고, 매번
+      atan2 2회 + degrees 2회를 계산했다(atan2 만 2,380만 콜/4.5초).
+
+      그런데 이동 방향은 16개짜리 고정 테이블이라 조합이 16x16=256 가지뿐이다.
+      런타임에 매번 삼각함수를 돌 이유가 전혀 없어서 전부 미리 계산한다.
+
+    ★ TURN_COST 를 곱하지 않은 '순수 기하량'만 저장한다 - CLI(--turn-cost)로
+      런타임에 값을 바꿀 수 있으므로, 곱셈은 쓰는 시점에 한다. 여기에
+      TURN_COST 를 미리 곱해 넣으면 플래그가 조용히 안 먹는 버그가 된다."""
+    n = len(MOVE_TABLE)
+    angs = [math.degrees(math.atan2(dy, dx)) for (dx, dy), _, _ in MOVE_TABLE]
+    table = []
+    for a0 in angs:
+        row = []
+        for a1 in angs:
+            row.append(abs((a1 - a0 + 180) % 360 - 180) / 90.0)
+        table.append(tuple(row))
+    return tuple(table)
+
+
+TURN_DIFF_TABLE = _build_turn_diff_table()
+
+
 def planning_grid(g, strict=True):
     """경로계획용으로 값을 치환한 지도 사본. 확정 채움(1)을 막고 싶으면
     3으로 바꿔서 넘긴다. ★미확정(2)은 더 이상 grid 에 나오지 않으므로
@@ -1135,6 +1164,11 @@ def planning_grid(g, strict=True):
 
 
 def turn_penalty(prev_dir, dx, dy):
+    """진입 방향이 바뀔 때 무는 비용.
+
+    ★ bfs_from 은 더 이상 이 함수를 쓰지 않는다(TURN_DIFF_TABLE 조회로
+      대체 - 위 _build_turn_diff_table 주석 참고). 외부/테스트에서
+      임의 방향으로 회전 비용을 물어볼 때를 위해 남겨둔 참조 구현이다."""
     if prev_dir is None or TURN_COST <= 0:
         return 0.0
     a0 = math.degrees(math.atan2(prev_dir[1], prev_dir[0]))
@@ -1144,16 +1178,34 @@ def turn_penalty(prev_dir, dx, dy):
 
 
 def bfs_from(g, sx, sy, heading_deg=None):
-    start_dir = None
-    if heading_deg is not None and TURN_COST > 0:
-        ar = math.radians(heading_deg)
-        start_dir = (math.cos(ar), math.sin(ar))
+    """로봇에서 도달 가능한 칸 전체 + 부모포인터/누적비용/진입방향.
+
+    reach[(x,y)] = (부모좌표, 누적비용, 진입방향_인덱스)
+      ★ 인덱스 2 의 의미가 바뀌었다: 예전엔 (dx,dy) 튜플이었는데 이제
+        MOVE_TABLE 의 인덱스(int) 다. TURN_DIFF_TABLE 을 O(1) 로 조회하기
+        위해서다. 외부 코드는 인덱스 0(부모)과 1(비용)만 쓰므로 영향 없다
+        (path_from/목표선정/find_confirm_point 전부 확인함).
+
+    [근사 주의] 회전 비용을 정확히 다루려면 상태가 (x, y, 방향)이어야 한다.
+    여기서는 부모에 기록된 진입 방향만 보므로, 한번 확정된 칸에 나중에 더
+    좋은 방향으로 도달해도 갱신되지 않는다. 최적은 아니지만 상태 수를
+    16배로 늘리지 않고 회전을 크게 줄인다."""
+    use_turn = TURN_COST > 0
+
+    # 시작 헤딩은 16방향 중 하나가 아니라 임의 실수각이라 테이블에 없다.
+    # bfs_from 한 번당 16개만 계산하면 되므로 여기서 미리 뽑아둔다.
+    start_diffs = None
+    if heading_deg is not None and use_turn:
+        start_diffs = tuple(
+            abs((math.degrees(math.atan2(dy, dx)) - heading_deg + 180) % 360 - 180) / 90.0
+            for (dx, dy), _, _ in MOVE_TABLE)
 
     for strict in (True, False):
         pg = planning_grid(g, strict)
         cmap = compute_clearance_map(pg)
         smap = compute_safe_map(pg)
-        reach = {(sx, sy): (None, 0.0, start_dir)}
+        # 진입방향 인덱스: -1 = 시작 칸(아직 이동 안 함, start_diffs 사용)
+        reach = {(sx, sy): (None, 0.0, -1)}
         pq = [(0.0, sx, sy)]
         done = set()
         while pq:
@@ -1161,8 +1213,15 @@ def bfs_from(g, sx, sy, heading_deg=None):
             if (cx, cy) in done:
                 continue
             done.add((cx, cy))
-            prev_dir = reach[(cx, cy)][2]
-            for (dx, dy), stepc, mids in MOVE_TABLE:
+            prev_i = reach[(cx, cy)][2]
+            # 이 칸에서 나가는 16방향 각각의 회전 벌점을 한 번에 고른다
+            if not use_turn:
+                diffs = None
+            elif prev_i >= 0:
+                diffs = TURN_DIFF_TABLE[prev_i]
+            else:
+                diffs = start_diffs          # None 이면 시작 헤딩 미지정 = 벌점 없음
+            for i, ((dx, dy), stepc, mids) in enumerate(MOVE_TABLE):
                 nx, ny = cx + dx, cy + dy
                 if not (0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE):
                     continue
@@ -1176,10 +1235,13 @@ def bfs_from(g, sx, sy, heading_deg=None):
                 if blocked:
                     continue
                 lack = CLEARANCE_WANT - cmap[ny][nx]
-                nd = (d + stepc + turn_penalty(prev_dir, dx, dy)
-                      + (CLEARANCE_COST * lack if lack > 0 else 0.0))
+                nd = d + stepc
+                if diffs is not None:
+                    nd += TURN_COST * diffs[i]
+                if lack > 0:
+                    nd += CLEARANCE_COST * lack
                 if (nx, ny) not in reach or nd < reach[(nx, ny)][1]:
-                    reach[(nx, ny)] = ((cx, cy), nd, (dx, dy))
+                    reach[(nx, ny)] = ((cx, cy), nd, i)
                     heapq.heappush(pq, (nd, nx, ny))
         if len(reach) > 1 or not (strict and SAFE_BLOCK_ESTIMATED):
             return reach
@@ -1204,20 +1266,40 @@ def path_from(reach, target):
 # =============================================================================
 
 def has_line_of_sight(g, x0, y0, x1, y1, max_range=SCAN_RANGE):
-    blockers = (1, 3) if LOS_BLOCK_CONFIRMED else (3,)
+    """(x0,y0) 에서 (x1,y1) 이 보이는지.
+
+    [수정4] 무엇을 시야 차단으로 볼지가 LOS_BLOCK_CONFIRMED 로 갈린다.
+    값 3(직접관측)만 막으면 광선이 드문드문한 관측점 사이를 빠져나가
+    장애물 뒤 미탐색 칸까지 '보인다'고 오판한다. 확정(1)까지 막으면
+    헛걸음은 줄지만 추정 도형이 과대할 때 빈 칸을 조기에 포기해버린다.
+
+    ★성능: 실측 프로파일에서 이 함수가 48만 콜/10.4초로 최대 병목이었다
+      (can_observe/find_observation_point 가 사거리 박스를 전수 훑으며
+      칸마다 부른다). 아래 미세최적화는 전부 '결과가 완전히 동일한' 것만
+      골랐다 - 판정 로직을 바꾸면 탐사 경로 자체가 달라져 그동안 쌓은
+      실측 비교가 전부 무의미해지기 때문이다:
+        - g[y][x] -> g[y, x] : 전자는 행 뷰(ndarray) 를 만든 뒤 다시
+          인덱싱해서 임시 객체가 생긴다. 후자는 스칼라 직접 조회.
+        - `in blockers` 튜플 멤버십 -> 정수 비교 2회
+        - 루프 불변식(dx, dy, blk_confirmed) 을 루프 밖으로 호이스팅
+      ※ int(round(...)) 는 그대로 뒀다. round 는 은행가 반올림이라
+        int(v+0.5) 로 바꾸면 정확히 .5 인 지점에서 결과가 갈린다."""
     dist = math.hypot(x1 - x0, y1 - y0)
     if dist > max_range:
         return False
     steps = int(dist) + 1
+    dx, dy = x1 - x0, y1 - y0
+    blk_confirmed = LOS_BLOCK_CONFIRMED
     for i in range(1, steps + 1):
         t = i / steps
-        x = int(round(x0 + (x1 - x0) * t))
-        y = int(round(y0 + (y1 - y0) * t))
-        if (x, y) == (x1, y1):
+        x = int(round(x0 + dx * t))
+        y = int(round(y0 + dy * t))
+        if x == x1 and y == y1:
             return True
         if not (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE):
             return False
-        if g[y][x] in blockers:
+        v = g[y, x]
+        if v == 3 or (blk_confirmed and v == 1):
             return False
     return True
 
