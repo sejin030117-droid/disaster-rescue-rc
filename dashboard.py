@@ -27,15 +27,21 @@ try:
     STREAM_URL = f"tcp://{C.PI_IP}:{C.CAMERA_PORT}"
 except ImportError:
     STREAM_URL = "tcp://0.0.0.0:8888" # 기본값
+    C = None
 
+# ── 위험 임계값 (§8-3 단일 출처화) ──────────────────────────────────
+# "위험" 단계는 robot_config.FIRE_TEMP_C/GAS_PPM 을 그대로 따라간다 -
+# 지도 화재원/가스구역, 실제 경로 회피와 같은 값이어야 "카드는 정상인데
+# 왜 이 경로를 피하지?" 같은 혼란이 안 생긴다. "경계(주의)" 조기경고선은
+# 그보다 낮게 별도로 잡는다.
+# ★가스 danger 값이 기존 60 -> 40 으로 바뀐다(FIRE 는 기존 50 그대로,
+#   변화 없음) - GAS_PPM(경로회피/지도표시 기준)과 다르게 놀던 걸 맞춘
+#   결과다. 카드에서 "위험"이 이제 더 낮은 농도에서부터 뜬다.
 FIRE_TEMP_C  = getattr(C, "FIRE_TEMP_C", 50.0)
 GAS_PPM      = getattr(C, "GAS_PPM", 40.0)
 TEMP_WARN_C  = getattr(C, "TEMP_WARN_C", 40.0)
 GAS_WARN_PPM = getattr(C, "GAS_WARN_PPM", 30.0)
 
-# ═══════════════════════════════════════════════════════════════
-#  색 / 스타일
-# ═══════════════════════════════════════════════════════════════
 BG        = "#0d1117"      
 PANEL     = "#161b22"      
 BORDER    = "#232b36"
@@ -82,20 +88,10 @@ QLabel#topTitle {{
 }}
 """
 
-# ═══════════════════════════════════════════════════════════════
-#  데이터 및 카메라 그래버
-# ═══════════════════════════════════════════════════════════════
-GRID_N = 20 
+GRID_N = 20
 
 
 def sensor_level(v, warn, danger):
-    """정상/경계/위험 3단계 판정. (표시텍스트, 색상) 을 반환한다.
-
-    [사용자 피드백] 온도/가스 카드가 시각적으로 "정상/위험" 2단계처럼만
-    보인다는 지적 - MetricCard 가 생성 시점 고정색(예: 온도=DANGER 빨강)을
-    계속 써서, sub 텍스트는 3단계였어도 눈에 띄는 큰 숫자 색은 안 바뀌었다.
-    이제 이 함수가 반환하는 색을 MetricCard.update_value(level_color=...)
-    로 넘겨 숫자·서브텍스트·스파크라인 색이 전부 같이 바뀐다."""
     if v is None:
         return "", TEXT_DIM
     if v >= danger:
@@ -122,14 +118,12 @@ class RobotState:
     hazards:   list = field(default_factory=list)
     robot_cell: tuple | None = None
 
-    # ── 요구조자 구조 경로 (탐사 완료 후 sim_bridge.DashViz._plan_rescue 가 채움) ──
     rescue_target:      tuple | None = None
-    rescue_path_safe:   list = field(default_factory=list)   # 고온+가스 모두 회피
-    rescue_path_risky:  list = field(default_factory=list)   # 가스만 경유(고온 회피)
+    rescue_path_safe:   list = field(default_factory=list)
+    rescue_path_risky:  list = field(default_factory=list)
 
     temp_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
     gas_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
-    # 히트맵 표시용 상태 격자: 0=해당없음 1=장애물 2=확인불가(가려서 못 봄)
     block_grid: np.ndarray = field(default_factory=lambda: np.zeros((GRID_N, GRID_N), dtype=np.int8))
     detections: list = field(default_factory=list)
 
@@ -162,7 +156,6 @@ class RobotState:
             del buf[:-maxlen]
 
 class FrameGrabber:
-    """tcp 스트림에서 최신 프레임만 유지하는 버퍼링 억제 그래버"""
     def __init__(self, url):
         self.cap = cv2.VideoCapture(url)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -196,18 +189,15 @@ class FrameGrabber:
         if self.cap.isOpened():
             self.cap.release()
 
-# ═══════════════════════════════════════════════════════════════
-#  통합 소스 (시뮬레이션 맵 + 카메라 스레드)
-# ═══════════════════════════════════════════════════════════════
 class SimSource:
-    def __init__(self, state: RobotState, seed=13, live_cam=False):
+    def __init__(self, state: RobotState, seed=11, live_cam=False):
         import sim_bridge as B
         self.B = B
         self.s = state
         self.t = 0.0
         self.rng = np.random.default_rng(seed)
         self.live_cam = live_cam 
-        self.cam_running = True # ★ 시뮬레이션 done과 무관하게 카메라를 살려두는 플래그
+        self.cam_running = True
         
         for k in self.s.modules:
             self.s.modules[k] = True
@@ -216,7 +206,6 @@ class SimSource:
         self.done = False
         self.mode = None
 
-        # 1. 맵 시뮬레이션 스레드 시작
         try:
             import path_planner_sim2 as S2
         except Exception as e:                        
@@ -231,7 +220,6 @@ class SimSource:
             self.path = None
             self.fr = []
 
-        # 2. 라이브 카메라 스레드 시작
         if self.live_cam:
             self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
             self.cam_thread.start()
@@ -274,7 +262,6 @@ class SimSource:
         frame_count = 0
         first_frame_received = False
         
-        # ★ self.done이 아닌 self.cam_running 플래그 사용
         while self.cam_running: 
             frame = grab.read()
             if frame is not None:
@@ -285,7 +272,6 @@ class SimSource:
                 frame_count += 1
                 detections = []
                 
-                # ★ 추론 도중 에러가 나도 스레드가 죽지 않도록 방어
                 try:
                     if model is not None and frame_count % 2 == 0:
                         results = model(frame, verbose=False, conf=0.6)[0]
@@ -399,13 +385,6 @@ class SimSource:
         return ex.scan_range
 
     def _detect(self, s):
-        """카메라 화면에 보여줄 가짜 FIRE 탐지 박스.
-
-        [버그 수정] self.ex 는 _tick_mini(대체 경로) 에서만 만들어지는데,
-        이 메서드는 _tick_sim2(주 경로) 에서도 호출된다. sim2 모드에서
-        self.ex.heading 을 그대로 참조해 매 tick(100ms)마다
-        AttributeError 로 크래시 나던 문제 - self.S2(path_planner_sim2
-        모듈)의 robot_angle 을 대신 쓰도록 모드별로 분기했다."""
         if s.temp_c is not None and s.temp_c > 45:
             conf = min(0.99, 0.5 + (s.temp_c - 45) / 40)
             heading = self.S2.robot_angle if self.mode == "sim2" else self.ex.heading
@@ -425,13 +404,9 @@ class SimSource:
         return (f + self.rng.normal(0, 3, f.shape)).clip(0, 255).astype(np.uint8)
 
     def stop(self):
-        """앱 종료 시 스레드 종료 트리거"""
         self.done = True
         self.cam_running = False
 
-# ═══════════════════════════════════════════════════════════════
-#  공용 위젯
-# ═══════════════════════════════════════════════════════════════
 def card(title: str | None = None) -> tuple[QFrame, QVBoxLayout]:
     f = QFrame(); f.setObjectName("card")
     lay = QVBoxLayout(f); lay.setContentsMargins(12, 10, 12, 10); lay.setSpacing(8)
@@ -473,14 +448,6 @@ class MetricCard(QFrame):
         lay.addWidget(self.spark)
 
     def update_value(self, v, fmt="{:.1f}", sub="", hist=None, level_color=None):
-        """level_color 를 주면 값 색상을 그걸로 덮어쓴다(정상/경계/위험
-        3단계 표시용 - sensor_level() 참고). 안 주면 생성자에 넣은
-        고정색을 그대로 쓴다(거리/습도처럼 위험도 개념이 없는 카드용).
-
-        [사용자 피드백 반영] 예전엔 온도 카드가 항상 DANGER(빨강) 고정이라
-        값이 정상이어도 숫자가 계속 빨갛게 보였다 - 아래 sub 텍스트만
-        "정상/MID/HIGH"로 3단계였고 정작 눈에 띄는 큰 숫자 색은 안 바뀌어서
-        사실상 2단계(그냥 항상 위험해 보임)처럼 느껴졌다."""
         if v is None:
             self.val.setText("--")
             self.val.setStyleSheet(f"color:{TEXT_DIM};")
@@ -505,10 +472,8 @@ class HeatGrid(QWidget):
              (0.50, (60, 170, 90)),
              (0.75, (215, 175, 55)),
              (1.00, (225, 70, 55))]
-    # ★ map_canvas.py 의 C_OBST/C_PINK 와 같은 색 - "장애물"/"확인 불가"가
-    #   메인 지도와 히트맵 양쪽에서 같은 색으로 보이도록 맞췄다.
-    C_BLOCK_OBST = QColor("#11151d")   # 장애물 - 절대 못 잰다
-    C_BLOCK_PINK = QColor("#a1547a")   # 확인 불가 - 가려서 확인을 포기함
+    C_BLOCK_OBST = QColor("#11151d")
+    C_BLOCK_PINK = QColor("#a1547a")
 
     def __init__(self, vmin, vmax, fmt="{:.0f}"):
         super().__init__()
@@ -541,21 +506,28 @@ class HeatGrid(QWidget):
         p.setRenderHint(QPainter.Antialiasing, False)
 
         W, H = self.width(), self.height() - 14
-        s = min(W / n, H / n)              # ★ 정사각형 셀 - 작은 쪽 기준
+        # ★정사각형 셀 유지 - 폭/높이를 따로 나누면(cw!=ch) 카드가 정사각형이
+        # 아닐 때 셀이 직사각형으로 늘어난다. MapCanvas 와 동일하게 작은
+        # 쪽(min(W,H))에 맞춰 정사각형 격자를 만들고, 남는 공간은 가운데
+        # 정렬 여백으로 둔다. 컬러바(아래 by)는 원래대로 위젯 전체 폭을
+        # 그대로 쓴다 - 격자 위치와 무관하게 항상 같은 자리에 있는 게
+        # 범례처럼 더 읽기 쉽다.
+        s = min(W / n, H / n)
         grid_px = s * n
-        ox = (W - grid_px) / 2              # ★ 가운데 정렬 여백
+        ox = (W - grid_px) / 2
         oy = (H - grid_px) / 2
         cw = ch = s
+        # ★셀이 좁아지면(해상도를 올렸을 때, 또는 창이 좁아졌을 때) 고정
+        # 폰트 크기로는 숫자가 옆 칸까지 번져 안 읽힌다(GRID_N=20으로
+        # 올렸을 때 실측 확인됨). 셀 크기에 비례해 폰트를 줄이고, 그래도
+        # 못 들어갈 만큼 좁으면(11px 미만) 숫자를 생략하고 색상만 보여준다.
         pt = max(4, min(7, int(s * 0.32)))
         f = QFont(); f.setPointSize(pt); p.setFont(f)
         show_text = s >= 8
 
         for r in range(n):
             for c in range(n):
-                x, y = ox + c * cw, oy + r * ch   # ★ ox, oy 추가
-                # ★ 장애물/확인불가는 값 유무와 무관하게 항상 이 색으로
-                #   덮는다 - "이 구역은 원리적으로 못 잰다"는 정보가
-                #   "우연히 값이 하나 있었다"보다 중요하다.
+                x, y = ox + c * cw, oy + r * ch
                 blk = self.block[r, c] if self.block is not None else 0
                 if blk == 1:
                     p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1,
@@ -573,7 +545,7 @@ class HeatGrid(QWidget):
                 t = (v - self.vmin) / (self.vmax - self.vmin)
                 col = self._color(t)
                 p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1, col)
-                if show_text:                      # ★ 셀 11px 미만이면 숫자 생략
+                if show_text:
                     lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
                     p.setPen(QColor("#080c12") if lum > 150 else QColor("#e6edf3"))
                     p.drawText(int(x), int(y), int(cw), int(ch),
@@ -670,9 +642,6 @@ class StatusRow(QWidget):
         self.st.setStyleSheet(f"color:{c}; font-size:11px;")
         self.st.setText("OK" if ok else "FAIL")
 
-# ═══════════════════════════════════════════════════════════════
-#  메인 창
-# ═══════════════════════════════════════════════════════════════
 class Dashboard(QWidget):
 
     def __init__(self, state: RobotState, source=None):
@@ -773,7 +742,8 @@ class Dashboard(QWidget):
         self.det_line = QLabel("탐지 없음")
         self.det_line.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
         lay.addWidget(self.det_line)
-        col.addWidget(c, 3)
+        col.addWidget(c, 2)   # ★ 카메라 비중 축소 (3→2) - 실물 카메라 없이는
+                              #   노이즈 텍스처만 채우는 자리라 우선순위 낮춤
 
         grids = QHBoxLayout(); grids.setSpacing(10)
         c1, l1 = card("온도 맵 (\u00b0C)")
@@ -782,11 +752,14 @@ class Dashboard(QWidget):
         c2, l2 = card("가스 농도 맵 (ppm)")
         self.heat_g = HeatGrid(0, 60)
         l2.addWidget(self.heat_g); grids.addWidget(c2)
-        col.addLayout(grids, 3)
+        col.addLayout(grids, 5)   # ★ 히트맵 비중 확대 (3→5) - 세분화된
+                                  #   해상도(GRID_N=20)를 살리려면 더 큰
+                                  #   자리가 필요하다
 
         bottom = QHBoxLayout(); bottom.setSpacing(10)
 
         c3, l3 = card("시스템 상태")
+        c3.setMinimumHeight(180)   # ★ 비중 축소돼도 항목 7개가 안 찌그러지게
         self.rows = {}
         for name in self.state.modules:
             r = StatusRow(name); self.rows[name] = r; l3.addWidget(r)
@@ -794,6 +767,7 @@ class Dashboard(QWidget):
         bottom.addWidget(c3)
 
         c4, l4 = card("경로 계획 정보")
+        c4.setMinimumHeight(180)   # ★ 시스템상태 카드와 동일한 최소 높이
         self.lbl_goal   = QLabel(); self.lbl_pos = QLabel()
         self.lbl_remain = QLabel(); self.lbl_eta = QLabel()
         self.lbl_pstat  = QLabel()
