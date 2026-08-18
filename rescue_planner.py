@@ -42,9 +42,10 @@ rescue_planner.py -- 요구조자 구출을 위한 해저드 인식 경로 탐�
   더 안전할 수 있다).
 """
 import path_planner as P
+from robot_config import FIRE_TEMP_C, GAS_PPM
 
-FIRE_TEMP_C = 50.0      # sim_bridge.DashViz._hazards() / FIRE_CIRCLE_TEMP_C 와 동일
-GAS_PPM = 40.0
+# sim_bridge.DashViz._hazards() / FIRE_CIRCLE_TEMP_C 와 동일
+
 
 
 def _hazard_blocked_grid(grid, measured_t, measured_g, block_gas, block_temp):

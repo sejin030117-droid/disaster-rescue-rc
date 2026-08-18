@@ -28,6 +28,11 @@ try:
 except ImportError:
     STREAM_URL = "tcp://0.0.0.0:8888" # 기본값
 
+FIRE_TEMP_C  = getattr(C, "FIRE_TEMP_C", 50.0)
+GAS_PPM      = getattr(C, "GAS_PPM", 40.0)
+TEMP_WARN_C  = getattr(C, "TEMP_WARN_C", 40.0)
+GAS_WARN_PPM = getattr(C, "GAS_WARN_PPM", 30.0)
+
 # ═══════════════════════════════════════════════════════════════
 #  색 / 스타일
 # ═══════════════════════════════════════════════════════════════
@@ -80,7 +85,7 @@ QLabel#topTitle {{
 # ═══════════════════════════════════════════════════════════════
 #  데이터 및 카메라 그래버
 # ═══════════════════════════════════════════════════════════════
-GRID_N = 12          
+GRID_N = 20 
 
 
 def sensor_level(v, warn, danger):
@@ -195,7 +200,7 @@ class FrameGrabber:
 #  통합 소스 (시뮬레이션 맵 + 카메라 스레드)
 # ═══════════════════════════════════════════════════════════════
 class SimSource:
-    def __init__(self, state: RobotState, seed=31, live_cam=False):
+    def __init__(self, state: RobotState, seed=13, live_cam=False):
         import sim_bridge as B
         self.B = B
         self.s = state
@@ -235,7 +240,7 @@ class SimSource:
         import threading
         self.mode = "sim2"
         self.S2 = S2
-        S2._Viz = B.make_dash_viz(self.s)
+        S2._Viz = B.make_dash_viz(self.s, grid_n=GRID_N)
 
         def _run():
             try:
@@ -536,12 +541,18 @@ class HeatGrid(QWidget):
         p.setRenderHint(QPainter.Antialiasing, False)
 
         W, H = self.width(), self.height() - 14
-        cw, ch = W / n, H / n
-        f = QFont(); f.setPointSize(7); p.setFont(f)
+        s = min(W / n, H / n)              # ★ 정사각형 셀 - 작은 쪽 기준
+        grid_px = s * n
+        ox = (W - grid_px) / 2              # ★ 가운데 정렬 여백
+        oy = (H - grid_px) / 2
+        cw = ch = s
+        pt = max(4, min(7, int(s * 0.32)))
+        f = QFont(); f.setPointSize(pt); p.setFont(f)
+        show_text = s >= 8
 
         for r in range(n):
             for c in range(n):
-                x, y = c * cw, r * ch
+                x, y = ox + c * cw, oy + r * ch   # ★ ox, oy 추가
                 # ★ 장애물/확인불가는 값 유무와 무관하게 항상 이 색으로
                 #   덮는다 - "이 구역은 원리적으로 못 잰다"는 정보가
                 #   "우연히 값이 하나 있었다"보다 중요하다.
@@ -562,10 +573,11 @@ class HeatGrid(QWidget):
                 t = (v - self.vmin) / (self.vmax - self.vmin)
                 col = self._color(t)
                 p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1, col)
-                lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
-                p.setPen(QColor("#080c12") if lum > 150 else QColor("#e6edf3"))
-                p.drawText(int(x), int(y), int(cw), int(ch),
-                           Qt.AlignCenter, self.fmt.format(v))
+                if show_text:                      # ★ 셀 11px 미만이면 숫자 생략
+                    lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
+                    p.setPen(QColor("#080c12") if lum > 150 else QColor("#e6edf3"))
+                    p.drawText(int(x), int(y), int(cw), int(ch),
+                               Qt.AlignCenter, self.fmt.format(v))
 
         by = H + 3
         for i in range(W):
@@ -845,10 +857,10 @@ class Dashboard(QWidget):
             None if s.dist_mm is None else s.dist_mm / 1000, "{:.2f}",
             f"신뢰도 {s.dist_conf*100:.0f}%",
             [None if math.isnan(v) else v/1000 for v in s.hist_dist])
-        t_sub, t_color = sensor_level(s.temp_c, 40, 55)
+        t_sub, t_color = sensor_level(s.temp_c, TEMP_WARN_C, FIRE_TEMP_C)
         self.m_temp.update_value(s.temp_c, "{:.1f}", t_sub, s.hist_temp,
                                  level_color=t_color)
-        g_sub, g_color = sensor_level(s.gas_ppm, 30, 60)
+        g_sub, g_color = sensor_level(s.gas_ppm, GAS_WARN_PPM, GAS_PPM)
         self.m_gas.update_value(s.gas_ppm, "{:.0f}", g_sub, s.hist_gas,
                                 level_color=g_color)
         self.m_humid.update_value(s.humid_pct, "{:.0f}", "")

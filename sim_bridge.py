@@ -24,12 +24,43 @@ sim_bridge.py — 탐사 시뮬레이터를 대시보드 2D 맵에 연결
 ────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
-
 import math
 import random
 import time
 
 import numpy as np
+
+try:
+    import robot_config as _RC
+except ImportError:
+    _RC = None
+FIRE_TEMP_C = getattr(_RC, "FIRE_TEMP_C", 50.0)
+GAS_PPM = getattr(_RC, "GAS_PPM", 40.0)
+
+def _cluster_points(points, gap):
+    """points: [(x, y, v), ...]. gap 칸 이내로 연결된(전이적으로도) 점들을
+    한 그룹으로 묶는다(union-find)."""
+    n = len(points)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if math.hypot(points[i][0] - points[j][0],
+                         points[i][1] - points[j][1]) < gap:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(points[i])
+    return list(groups.values())
 
 # ═══════════════════════════════════════════════════════════════
 #  1. 격자 → RGB 렌더링
@@ -213,7 +244,7 @@ class DashViz:
     grid_n = 12           # 대시보드 히트맵 격자 크기
     min_interval_s = 0.08  # ★ 이 이상 빠르게는 갱신 안 함 (대략 12Hz 상한)
     RESCUE_REPLAN_EVERY = 5   # 요구조자 발견 후 이 스텝마다 경로 재계산
-    FIRE_CIRCLE_TEMP_C = 50.0  # ★불(원) 표시 임계값.
+    FIRE_CIRCLE_TEMP_C = FIRE_TEMP_C  # ★불(원) 표시 임계값.
                                #   [근거] 맨몸 인간 기준 - 습도 낮은 공기는
                                #   짧은 시간이면 고온도 버티지만(사우나
                                #   80~100도/10~20분), 그건 "탈출 가능+휴식"
@@ -380,9 +411,9 @@ class DashViz:
           ScalarField 발생원이 2개라 실제로 그런 상황이 생길 수 있다)."""
         out = []
         for (x, y), v in self.measured_g.items():
-            if v > 40:
+            if v > GAS_PPM:
                 out.append({"kind": "gas", "x": x, "y": y,
-                            "r": 4 + (v - 40) / 6, "level": (v - 40) / 25})
+                            "r": 4 + (v - GAS_PPM) / 6, "level": (v - GAS_PPM) / 25})
         merged = []
         for h in out:
             for m in merged:
@@ -395,15 +426,16 @@ class DashViz:
                 merged.append(dict(h))
 
         fire_cells = [(x, y, v) for (x, y), v in self.measured_t.items()
-                     if v >= self.FIRE_CIRCLE_TEMP_C]
+                    if v >= self.FIRE_CIRCLE_TEMP_C]
         if fire_cells:
-            cx = sum(x for x, y, v in fire_cells) / len(fire_cells)
-            cy = sum(y for x, y, v in fire_cells) / len(fire_cells)
-            r = max(math.hypot(x - cx, y - cy) for x, y, v in fire_cells) + 1.5
+            dominant = max(_cluster_points(fire_cells, gap=9), key=len)
+            cx = sum(x for x, y, v in dominant) / len(dominant)
+            cy = sum(y for x, y, v in dominant) / len(dominant)
+            r = max(math.hypot(x - cx, y - cy) for x, y, v in dominant) + 1.5
             level = min(max((v - self.FIRE_CIRCLE_TEMP_C) / 20
-                            for x, y, v in fire_cells), 1.0)
+                            for x, y, v in dominant), 1.0)
             merged.append({"kind": "fire", "x": cx, "y": cy,
-                          "r": max(r, 3.0), "level": level})
+                        "r": max(r, 3.0), "level": level})
 
         return merged
 

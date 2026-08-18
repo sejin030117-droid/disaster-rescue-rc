@@ -526,11 +526,12 @@ class MapCanvas(QWidget):
     def _draw_legend(self, p):
         """지도 위쪽 바깥에 여러 줄로. 지도를 가리지 않는다."""
         s_, ox, oy, n = self._tf
+        pad_l = 46 if self.show_axes else 8 
         f = QFont(); f.setPointSize(7); p.setFont(f)
         top = oy - self.LEGEND_H + self.LEGEND_PAD_TOP
         for row_i, row in enumerate(self._legend_rows):
             y = top + row_i * self.LEGEND_ROW_H
-            x = ox
+            x = pad_l 
             for c, name, wtxt in row:
                 p.setPen(QPen(QColor("#4a5262"), 0.8))
                 p.setBrush(QBrush(c))
