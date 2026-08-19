@@ -1,6 +1,7 @@
 #	격자 A* 경로계획 핵심 — 16방향 이동, 안전맵/여유공간맵, 프런티어 탐색
 import heapq
 import math
+from collections import OrderedDict
 
 import numpy as np
 
@@ -8,6 +9,54 @@ GRID_SIZE = 60
 CELL_SIZE = 0.05
 ROBOT_SIZE_M = 0.25
 ROBOT_WIDTH_CELLS = int(ROBOT_SIZE_M / CELL_SIZE)  # 5
+
+# ── compute_clearance_map/compute_safe_map 캐시 ────────────────────────
+# ★[성능] 둘 다 grid 내용만 보고 값이 정해지는 순수함수라, 같은 grid 가
+# 다시 들어오면 항상 같은 결과다(안전하게 캐시 가능). 실측상 이 둘이
+# find_path() 전체 시간의 사실상 전부(맵 계산이 A* 탐색보다 훨씬 무겁다)
+# 를 차지하는데, 정확히 같은 grid 로 반복 호출되는 경우가 흔하다:
+#   - rescue_planner.plan_rescue_paths() 는 안전/위험 두 grid 를 만드는데,
+#     아직 가스 실측이 임계값을 넘은 적이 없으면 두 grid 가 바이트 단위로
+#     완전히 같다.
+#   - path_planner_sim2.place_rescuee_truths() 는 배치 시도마다(최대 500회
+#     x 인원수) 도달 가능성을 find_path 로 확인하는데, 그 안에서 쓰는
+#     test_grid 는 루프 내내 단 한 번도 안 바뀐다 - 즉 첫 호출만 계산하고
+#     나머지 수백 번은 전부 캐시로 공짜다.
+#   - 미션 후반(탐사 끝, "return"/"done" 단계)에는 grid 가 더 안 바뀌는데
+#     구조경로는 RESCUE_REPLAN_EVERY 마다 계속 재계산을 시도하므로, 이
+#     구간에서 캐시 적중률이 특히 높다.
+# 캐시 키가 grid 내용 자체(바이트)라 잘못된 결과가 나올 여지가 없다 -
+# 크기만 작게 유지하면(오래 쓰던 grid 는 밀려나게) 메모리도 안전하다.
+_MAP_CACHE_SIZE = 16
+_clearance_cache: "OrderedDict" = OrderedDict()
+_safe_cache: "OrderedDict" = OrderedDict()
+
+
+def _cache_lookup(cache, key):
+    if key is None or key not in cache:
+        return None
+    cache.move_to_end(key)
+    return cache[key]
+
+
+def _cache_store(cache, key, value):
+    if key is None:
+        return
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > _MAP_CACHE_SIZE:
+        cache.popitem(last=False)
+
+
+def _grid_cache_key(grid, *extra):
+    """grid.tobytes() 를 키로 쓴다 - numpy 배열이 아니면(예: 순수 파이썬
+    리스트를 넘기는 호출부) 캐시를 그냥 안 쓴다(None 반환 -> 매번 재계산,
+    이전과 동일하게 항상 정답이지만 느림). 크래시를 내느니 캐시 없이
+    도는 쪽을 택한다."""
+    try:
+        return (grid.tobytes(), *extra)
+    except AttributeError:
+        return None
 
 
 def is_safe_cell(grid, x, y, margin=None):
@@ -49,7 +98,15 @@ CLEARANCE_COST = 1.2    # 여유 1칸 부족할 때마다 더해지는 비용
 def compute_clearance_map(grid, want=CLEARANCE_WANT):
     """모든 칸의 '장애물까지 거리'를 한 번에 계산(다중소스 BFS).
     이웃마다 clearance_of 를 부르면 노드당 16회 x 9x9 스캔이라 매우 느리다.
-    경로탐색 시작 시 한 번만 만들어 재사용한다."""
+    경로탐색 시작 시 한 번만 만들어 재사용한다.
+
+    ★[성능] grid 내용이 이전 호출과 똑같으면 캐시에서 즉시 반환한다 -
+    파일 상단 캐시 설명 참고."""
+    key = _grid_cache_key(grid, want)
+    cached = _cache_lookup(_clearance_cache, key)
+    if cached is not None:
+        return cached
+
     from collections import deque
     cm = [[want] * GRID_SIZE for _ in range(GRID_SIZE)]
     dq = deque()
@@ -68,6 +125,7 @@ def compute_clearance_map(grid, want=CLEARANCE_WANT):
             if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE and cm[ny][nx] > d + 1:
                 cm[ny][nx] = d + 1
                 dq.append((nx, ny))
+    _cache_store(_clearance_cache, key, cm)
     return cm
 
 
@@ -99,7 +157,14 @@ def get_neighbors_cost(x, y):
 
 def compute_safe_map(grid):
     """모든 칸에 대해 is_safe_cell 을 미리 계산(누적합 사용).
-    segment_safe 가 매번 5x5 스캔을 하면 너무 느려서, 한 번만 만들어 O(1) 조회한다."""
+    segment_safe 가 매번 5x5 스캔을 하면 너무 느려서, 한 번만 만들어 O(1) 조회한다.
+
+    ★[성능] compute_clearance_map 과 동일한 이유로 grid 내용 기준 캐시."""
+    key = _grid_cache_key(grid)
+    cached = _cache_lookup(_safe_cache, key)
+    if cached is not None:
+        return cached
+
     m = ROBOT_WIDTH_CELLS // 2
     # blocked 누적합
     ps = [[0] * (GRID_SIZE + 1) for _ in range(GRID_SIZE + 1)]
@@ -116,6 +181,7 @@ def compute_safe_map(grid):
             x0, y0, x1, y1 = x - m, y - m, x + m, y + m
             tot = ps[y1 + 1][x1 + 1] - ps[y0][x1 + 1] - ps[y1 + 1][x0] + ps[y0][x0]
             safe[y][x] = (tot == 0)
+    _cache_store(_safe_cache, key, safe)
     return safe
 
 
@@ -179,8 +245,42 @@ def find_frontiers(grid):
     return list(zip(xs.tolist(), ys.tolist()))
 
 
+_MAX_PATH_CACHE_SIZE = 32
+_path_cache: "OrderedDict" = OrderedDict()
+_PATH_CACHE_MISS = object()   # ★ None 은 "경로 없음"이라는 정상적인 캐시된
+                              #   값일 수 있으므로, "캐시에 아예 없음"과
+                              #   구분하려면 별도 sentinel 이 필요하다.
+
+
 def find_path(grid, start, goal):
-    """16방향 가중치 A*. 경유 칸까지 segment_safe 로 검사한다."""
+    """16방향 가중치 A*. 경유 칸까지 segment_safe 로 검사한다.
+
+    ★[성능] 실측 확인 - compute_clearance_map/compute_safe_map 을 캐시해도
+    A* 탐색 자체가 여전히 grid 하나당 6~12ms 걸린다(60x60, 16방향 확장 +
+    구간마다 segment_safe 샘플링이 노드당 비용이 큼). 그런데 구조경로는
+    같은 grid 로 반복 호출되는 경우가 흔하다(가스 실측 전 안전/위험 grid
+    가 동일, 미션 후반 grid 가 안 변해도 RESCUE_REPLAN_EVERY 마다 계속
+    재계산 시도). find_path 는 (grid, start, goal) 이 같으면 항상 같은
+    결과를 내는 순수함수이므로, 탐색 결과 자체를 캐시해서 맵 계산은 물론
+    A* 탐색까지 통째로 건너뛴다. 캐시 히트 시에도 반환값은 항상 사본을
+    준다 - 호출부가 실수로 내용을 바꾸면 캐시가 오염되는 걸 막기 위해."""
+    key = _grid_cache_key(grid, start, goal)
+    if key is not None:
+        cached = _path_cache.get(key, _PATH_CACHE_MISS)
+        if cached is not _PATH_CACHE_MISS:
+            _path_cache.move_to_end(key)
+            return list(cached) if cached is not None else None
+
+    result = _find_path_uncached(grid, start, goal)
+    if key is not None:
+        _path_cache[key] = result
+        _path_cache.move_to_end(key)
+        if len(_path_cache) > _MAX_PATH_CACHE_SIZE:
+            _path_cache.popitem(last=False)
+    return list(result) if result is not None else None
+
+
+def _find_path_uncached(grid, start, goal):
     cmap = compute_clearance_map(grid)
     smap = compute_safe_map(grid)
     open_set = [(0.0, start)]

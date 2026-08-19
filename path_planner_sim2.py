@@ -227,7 +227,16 @@ RESCUEE_EDGE_MARGIN = ROBOT_MARGIN + 1     # 지도 가장자리 제외 - 로봇
                                             # (rescue_planner.place_rescuee 에서
                                             #  실측으로 확인된 문제, §11 참고)
 RESCUEE_MIN_DIST_FROM_START = 15           # 시작점에서 이 정도는 떨어진 곳
+RESCUEE_COUNT = 2                          # 배치할 요구조자 수
+RESCUEE_MIN_DIST_BETWEEN = 15              # 요구조자끼리도 이 정도는 떨어지게
+                                            # (지도에서 두 SOS 마커가 안 겹치도록)
 RESCUEE_PLACEMENT_TRIES = 500              # 도달 가능한 위치 찾을 때까지 재시도
+RESCUEE_DETECT_TOL = 4.0                   # 광선이 요구조자 칸에서 이 정도(칸,
+                                            # =20cm) 이내로 지나가면 '봤다'로
+                                            # 인정 - 사람은 벽 한 칸(5cm)보다
+                                            # 훨씬 큰 표적이라 광선이 정확히
+                                            # 중심을 관통해야만 인정하면
+                                            # 비현실적으로 까다로워진다.
 
 
 # =============================================================================
@@ -258,9 +267,9 @@ obstacle_ids = []
 hidden_obstacles = {}
 
 # ── 요구조자 (§1-12) ── hidden_obstacles 와 같은 위상의 '정답' 값
-rescuee_truth = None          # (x, y) 또는 None(배치 실패)
-rescuee_discovered = False
-rescuee_discover_step = None
+rescuee_truths = []           # [(x, y), ...] - RESCUEE_COUNT 명, 배치 실패분은 빠짐
+rescuee_discovered = []       # rescuee_truths 와 같은 순서/길이의 bool 리스트
+rescuee_discover_step = []    # 위와 같은 길이 - 각각 발견된 스텝(None=아직)
 
 grid = None
 logodds = None
@@ -521,47 +530,63 @@ def build_truth(obstacles):
     return tid, ids
 
 
-def place_rescuee_truth(rng, robot_start):
-    """요구조자의 '정답' 위치를 정한다. hidden_obstacles 와 같은 위상 -
+def place_rescuee_truths(rng, robot_start, n=RESCUEE_COUNT):
+    """요구조자 n 명의 '정답' 위치를 정한다. hidden_obstacles 와 같은 위상 -
     로봇은 실제로 발견하기 전까지 이 좌표를 모른다(§17 run() 의 discover
     체크가 유일하게 이 값을 로봇 쪽으로 넘기는 지점).
 
-    조건 (요청 그대로):
+    한 명씩 아래 조건으로 배치한다 (요청 그대로):
       - 지도 가장자리(RESCUEE_EDGE_MARGIN 칸 이내) 제외 - 로봇 몸통(5x5)이
         원리적으로 못 들어가는 구간이다.
       - 장애물이 있는 구역 제외 - 로봇 몸통 반경(ROBOT_MARGIN)까지 포함해서
         장애물과 안 겹치는 자리만 후보로 삼는다.
       - 시작점에서 RESCUEE_MIN_DIST_FROM_START 칸 이상.
+      - 이미 배치된 다른 요구조자와도 RESCUEE_MIN_DIST_BETWEEN 칸 이상
+        떨어지게 - 지도에서 두 SOS 마커가 겹쳐 보이지 않게 한다.
       - (추가 검증) 장애물 배치만으로 실제 도달 가능한 자리인지 A* 로
         확인한다 - 위 조건을 다 만족해도 장애물이 우연히 완전히 둘러싸면
         갈 수 없는 자리가 나올 수 있어서다. 해저드(온도/가스)는 여기서
         고려하지 않는다 - 그건 순전히 로봇이 탐사하며 알아가는 정보라
-        배치 시점(정답 생성 단계)에서 참조하면 안 된다."""
+        배치 시점(정답 생성 단계)에서 참조하면 안 된다.
+
+    극단적으로 좁은 월드에서는 n 명을 다 못 채울 수 있다 - 그 경우 채운
+    만큼만 반환한다(예전 단일 요구조자 버전의 "이번 시드는 요구조자 없이
+    진행" 원칙과 동일하게, 실패를 조용히 흡수한다)."""
     test_grid = np.where(truth_id >= 0, 3, 0).astype(np.int64)
-    for _ in range(RESCUEE_PLACEMENT_TRIES):
-        x = rng.randint(RESCUEE_EDGE_MARGIN, GRID_SIZE - RESCUEE_EDGE_MARGIN - 1)
-        y = rng.randint(RESCUEE_EDGE_MARGIN, GRID_SIZE - RESCUEE_EDGE_MARGIN - 1)
-        if math.hypot(x - robot_start[0], y - robot_start[1]) < RESCUEE_MIN_DIST_FROM_START:
-            continue
-        clear = True
-        for dy in range(-ROBOT_MARGIN, ROBOT_MARGIN + 1):
-            for dx in range(-ROBOT_MARGIN, ROBOT_MARGIN + 1):
-                if truth_id[y + dy][x + dx] >= 0:
-                    clear = False
+    placed = []
+    for _ in range(n):
+        found = None
+        for _try in range(RESCUEE_PLACEMENT_TRIES):
+            x = rng.randint(RESCUEE_EDGE_MARGIN, GRID_SIZE - RESCUEE_EDGE_MARGIN - 1)
+            y = rng.randint(RESCUEE_EDGE_MARGIN, GRID_SIZE - RESCUEE_EDGE_MARGIN - 1)
+            if math.hypot(x - robot_start[0], y - robot_start[1]) < RESCUEE_MIN_DIST_FROM_START:
+                continue
+            if any(math.hypot(x - px, y - py) < RESCUEE_MIN_DIST_BETWEEN
+                   for px, py in placed):
+                continue
+            clear = True
+            for dy in range(-ROBOT_MARGIN, ROBOT_MARGIN + 1):
+                for dx in range(-ROBOT_MARGIN, ROBOT_MARGIN + 1):
+                    if truth_id[y + dy][x + dx] >= 0:
+                        clear = False
+                        break
+                if not clear:
                     break
             if not clear:
+                continue
+            if find_path(test_grid, robot_start, (x, y)) is not None:
+                found = (x, y)
                 break
-        if not clear:
-            continue
-        if find_path(test_grid, robot_start, (x, y)) is not None:
-            return (x, y)
-    return None   # 극단적으로 좁은 월드 - 이번 시드는 요구조자 없이 진행
+        if found is None:
+            break   # 더 못 채우면 채운 만큼만 반환
+        placed.append(found)
+    return placed
 
 
 def reset_world(seed, robot_start=(10, 10)):
     """월드 + 로봇 + 모든 추정 상태를 초기화. 시드가 같으면 항상 같은 월드."""
     global grid, truth_id, obstacle_ids, hidden_obstacles
-    global rescuee_truth, rescuee_discovered, rescuee_discover_step
+    global rescuee_truths, rescuee_discovered, rescuee_discover_step
     global robot_x, robot_y, robot_angle, step, collisions
     global hit_obs, cluster_cells, _next_cid, low_confidence_obstacles
     global unreachable_unknowns, obstacle_hull, obstacle_render_info
@@ -604,9 +629,9 @@ def reset_world(seed, robot_start=(10, 10)):
     sensor_rng = random.Random(seed * 7919 + 13)
     hidden_obstacles = generate_random_obstacles(OBSTACLE_COUNT, robot_x, robot_y, rng)
     truth_id, obstacle_ids = build_truth(hidden_obstacles)
-    rescuee_truth = place_rescuee_truth(rng, robot_start)
-    rescuee_discovered = False
-    rescuee_discover_step = None
+    rescuee_truths = place_rescuee_truths(rng, robot_start)
+    rescuee_discovered = [False] * len(rescuee_truths)
+    rescuee_discover_step = [None] * len(rescuee_truths)
 
     hit_obs = {}
     cluster_cells = {}
@@ -829,9 +854,66 @@ def _cone_min_distance(rx, ry, angle_deg, max_range):
     return best_cell, best_dist
 
 
+def _ray_sees_rescuee(rx, ry, angle_deg, max_range, tx, ty, tol=RESCUEE_DETECT_TOL):
+    """이번 광선(rx,ry 에서 angle_deg 방향, max_range 사거리)이 실제로
+    요구조자(tx,ty) 를 스치듯 지나가는지 확인한다.
+
+    ★ 장애물 스캔(_cast_ray_truth)과 동일하게 '진짜' 물리 세계(truth_id)
+    기준으로 가림을 판정한다 - 로봇이 아직 못 본(grid=-1) 벽이라도 실제로
+    거기 있으면 그 뒤의 사람은 안 보여야 실전성이 있다. 예전엔 로봇이
+    이미 그린 grid 기준으로만 가림을 판정해서, 아직 안 가본 벽 뒤도
+    '보인다'고 오판할 수 있었다.
+
+    ★[버그수정] 가림 판정은 반드시 (rx,ry)->(tx,ty) 실제 직선을 따라
+    걸어야 한다. 이 광선의 각도(angle_deg)를 따라 걸으면, tol 만큼 벗어난
+    광선은 사람과는 다른 경로를 훑게 돼 - 실제로 사람을 가리는 벽이
+    광선 자신의 경로 위엔 없어서 '안 막혔다'고 오판할 수 있었다(장애물에
+    가려진 요구조자가 포착되는 버그의 원인). has_line_of_sight() 와
+    동일한 보간 방식(t=i/steps, round)을 쓴다."""
+    ddist = math.hypot(tx - rx, ty - ry)
+    if ddist > max_range:
+        return False
+    ang_to = math.degrees(math.atan2(ty - ry, tx - rx))
+    off = (ang_to - angle_deg + 180) % 360 - 180
+    # 광선-사람 사이 수직거리 근사(사람이 광선에서 얼마나 벗어나 있는지).
+    # 각도차가 작을수록, 그리고 사람이 가까울수록 광선이 스칠 확률이 높다.
+    perp = abs(ddist * math.sin(math.radians(off)))
+    if perp > tol:
+        return False
+    dx, dy = tx - rx, ty - ry
+    steps = int(ddist) + 1
+    for i in range(1, steps + 1):
+        t = i / steps
+        x = int(round(rx + dx * t))
+        y = int(round(ry + dy * t))
+        if x == tx and y == ty:
+            return True
+        if not (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE):
+            return False
+        if truth_id[y][x] >= 0:
+            return False   # 진짜 장애물에 막힘 - 그 뒤는 안 보임
+    return True
+
+
+def _check_rescuee_detection(rx, ry, angle_deg, max_range):
+    """이번 광선이 아직 못 찾은 요구조자를 스쳤으면 발견 처리한다.
+    real_scan() 이 호출될 때마다(=실제 센서가 그 방향을 스캔할 때마다)
+    확인한다 - 로봇이 실제로 그 방향을 스캔해야만 발견되게 하기 위해서다
+    (§1-12 참고: 정답 위치 자체는 여전히 여기서만, '지금 보이는가'
+    판정에만 쓰고 로봇 로직 다른 곳엔 넘기지 않는다)."""
+    for i, (tx, ty) in enumerate(rescuee_truths):
+        if rescuee_discovered[i]:
+            continue
+        if _ray_sees_rescuee(rx, ry, angle_deg, max_range, tx, ty):
+            rescuee_discovered[i] = True
+            rescuee_discover_step[i] = step
+
+
 def real_scan(g, rx, ry, angle_deg, max_range=SCAN_RANGE):
     global rays_fired
     rays_fired += 1
+    if rescuee_truths:
+        _check_rescuee_detection(rx, ry, angle_deg, max_range)
 
     if USE_CONE_MODEL:
         hit_cell, dist = _cone_min_distance(rx, ry, angle_deg, max_range)
@@ -1479,9 +1561,9 @@ def evaluate():
         "missed": len(hidden_obstacles) - len(covered),
         "center_err": (sum(center_errs) / len(center_errs)) if center_errs else float('nan'),
         "max_obs": max((cluster_obs_count(c) for c in cluster_cells), default=0),
-        "rescuee_placed": rescuee_truth is not None,
-        "rescuee_discovered": rescuee_discovered,
-        "rescuee_discover_step": rescuee_discover_step,
+        "rescuee_placed": len(rescuee_truths),
+        "rescuee_discovered": sum(rescuee_discovered),
+        "rescuee_discover_step": list(rescuee_discover_step),
     }
 
 
@@ -1503,7 +1585,7 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
     global robot_x, robot_y, robot_angle, step, collisions, grid
     global turns, turn_deg, moves
     global phase, return_path, confirm_cid, confirm_done, confirm_gained
-    global returned, rescuee_discovered, rescuee_discover_step
+    global returned
 
     reset_world(seed)
     viz = _Viz(seed) if visualize else None
@@ -1537,18 +1619,19 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
                     record_hit(hit_cell, angle, dist, robot_x, robot_y)
 
         # ── 요구조자 발견 체크 (§1-12) ──────────────────────────────────
-        # ★ 정답(rescuee_truth)을 읽는 건 '지금 보이는가'를 판정할 때뿐이다.
+        # ★ 정답(rescuee_truths)을 읽는 건 '지금 보이는가'를 판정할 때뿐이다.
         #   위치 자체를 로봇 로직(경로계획 등) 어디에도 넘기지 않는다 -
-        #   발견되기 전까지는 이 블록 밖에서 rescuee_truth 를 참조하는 코드가
+        #   발견되기 전까지는 이 블록 밖에서 rescuee_truths 를 참조하는 코드가
         #   없어야 한다(hidden_obstacles/truth_id 와 동일한 격리 원칙).
-        #   판정 기준은 다른 곳과 동일하게 사거리+가시선(has_line_of_sight) -
-        #   ToF 가 실제로 그 지점까지 뚫려 있어야 '봤다'고 인정한다.
-        if rescuee_truth is not None and not rescuee_discovered:
-            tx, ty = rescuee_truth
-            if math.hypot(tx - robot_x, ty - robot_y) <= SCAN_RANGE \
-                    and has_line_of_sight(grid, robot_x, robot_y, tx, ty):
-                rescuee_discovered = True
-                rescuee_discover_step = step
+        #   실제 판정은 여기서 하지 않는다 - real_scan() 안의
+        #   _check_rescuee_detection() 이 매 광선(=실제 센서가 그 방향을
+        #   스캔하는 순간)마다 확인한다. 예전엔 로봇이 지금 어디를 스캔
+        #   중인지와 무관하게 사거리+시야만 확인했는데, 그러면 스캐너가
+        #   반대쪽을 보고 있어도 조건만 맞으면 '발견'돼 버려 비현실적이었다
+        #   (§실전성 - 실제로 광선이 스치고, 그 사이에 진짜 장애물이
+        #   없어야만 발견된다). 이 블록은 스캔(위 CONTINUOUS_SCAN 분기)이
+        #   먼저 끝난 뒤에 오므로 이번 스텝에 확인된 발견이 곧바로
+        #   아래(프런티어 탐색 등)에 반영된다.
 
         nu0 = find_nearest_unknown(grid, robot_x, robot_y)
         if nu0 is not None and math.hypot(nu0[0] - robot_x, nu0[1] - robot_y) <= SCAN_RANGE \

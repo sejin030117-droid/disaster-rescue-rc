@@ -37,10 +37,11 @@ except ImportError:
 FIRE_TEMP_C = getattr(_RC, "FIRE_TEMP_C", 50.0)
 GAS_PPM = getattr(_RC, "GAS_PPM", 40.0)
 
-def _cluster_points(points, gap):
-    """points: [(x, y, v), ...]. gap 칸 이내로 연결된(전이적으로도) 점들을
-    한 그룹으로 묶는다(union-find)."""
-    n = len(points)
+def _union_find_groups(n, pair_candidates, close):
+    """0..n-1 인덱스를 close(i,j) 가 True인 쌍끼리 전이적으로 묶는다.
+    pair_candidates(i) 는 i와 실제로 비교해봐야 할 후보 인덱스만 골라
+    돌려주는 이터러블 - 공간 해시로 인접 버킷만 넘기면 전수비교(O(n^2))
+    없이 묶을 수 있다."""
     parent = list(range(n))
 
     def find(i):
@@ -50,13 +51,59 @@ def _cluster_points(points, gap):
         return i
 
     for i in range(n):
-        for j in range(i + 1, n):
-            if math.hypot(points[i][0] - points[j][0],
-                         points[i][1] - points[j][1]) < gap:
+        for j in pair_candidates(i):
+            if j <= i:
+                continue
+            if close(i, j):
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[ri] = rj
+    return find, parent
 
+
+def _spatial_buckets(xs, ys, gap):
+    """(x,y) 목록을 gap 칸 크기 격자 버킷에 담는다. {(bx,by): [idx,...]}."""
+    buckets = {}
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        key = (int(x // gap), int(y // gap))
+        buckets.setdefault(key, []).append(i)
+    return buckets
+
+
+def _bucket_neighbors(buckets, bx, by):
+    out = []
+    for dbx in (-1, 0, 1):
+        for dby in (-1, 0, 1):
+            out += buckets.get((bx + dbx, by + dby), ())
+    return out
+
+
+def _cluster_points(points, gap):
+    """points: [(x, y, v), ...]. gap 칸 이내로 연결된(전이적으로도) 점들을
+    한 그룹으로 묶는다(union-find).
+
+    ★[성능] 예전엔 모든 점 쌍을 전수비교(O(n^2))했다 - 미션이 진행되며
+    측정 지점이 쌓일수록(로봇 궤적이 길어질수록) 매 스텝 호출되는 이
+    함수 하나가 점점 느려져 후반부 렉의 주된 원인이었다(실측: 200점
+    3.3ms / 500점 21ms / 1000점 76ms - n^2 스케일링과 정확히 일치).
+    gap 이내로 붙을 수 있는 점은 반드시 gap 크기 격자에서 같은 칸이나
+    바로 옆 칸(8방향)에 있으므로, 공간 해시로 그 후보만 비교하면 결과는
+    똑같으면서 실질적으로 O(n)에 가깝게 동작한다."""
+    n = len(points)
+    if n <= 1:
+        return [list(points)] if points else []
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    buckets = _spatial_buckets(xs, ys, gap)
+
+    def candidates(i):
+        bx, by = int(xs[i] // gap), int(ys[i] // gap)
+        return _bucket_neighbors(buckets, bx, by)
+
+    def close(i, j):
+        return math.hypot(xs[i] - xs[j], ys[i] - ys[j]) < gap
+
+    find, parent = _union_find_groups(n, candidates, close)
     groups = {}
     for i in range(n):
         groups.setdefault(find(i), []).append(points[i])
@@ -220,8 +267,16 @@ def grid_status_to_display(grid, n_out):
             continue
         r = n_out - 1 - cy   # ★ to_display_grid 와 동일한 뒤집기
         cat = 1 if grid[gy][gx] in (1, 3) else 2
-        if out[r][cx] < cat:
-            out[r][cx] = cat
+        # ★[버그수정] "장애물이 확인불가보다 우선"이라는 위 docstring과
+        # 달리, 예전 코드(if out[r][cx] < cat)는 1<2 라서 실제로는 나중에
+        # 스캔되는 확인불가(2)가 장애물(1)을 덮어써버렸다 - np.where 가
+        # 반환하는 스캔 순서에 따라 결과가 갈리는 버그. 장애물은 항상
+        # 최종값을 1로 강제하고, 확인불가는 아직 아무것도 없을 때만(0일
+        # 때만) 채워서 순서와 무관하게 장애물이 항상 이기게 한다.
+        if cat == 1:
+            out[r][cx] = 1
+        elif out[r][cx] == 0:
+            out[r][cx] = 2
     return out
 
 
@@ -273,9 +328,11 @@ class DashViz:
         self.measured_g = {}
         self.rng = random.Random(seed + 991)
         self._last_update = 0.0
-        # 요구조자는 이제 path_planner_sim2.rescuee_truth 가 정한다(정답).
-        # 여기서는 마지막으로 경로를 다시 계산한 스텝만 추적한다.
+        # 요구조자는 이제 path_planner_sim2.rescuee_truths 가 정한다(정답).
+        # 여기서는 마지막으로 경로를 다시 계산한 스텝과, 지금까지 발견된
+        # 것으로 확인해 화면에 반영한 인덱스만 추적한다.
         self._rescue_last_plan_step = -10 ** 9
+        self._rescue_known_idxs = []       # rescuee_truths 인덱스 중 이미 발견 처리한 것들
         self._rescue_error_shown = False   # 계산 오류 경고를 한 번만 찍기 위한 플래그
         n = S.GRID_SIZE
         self.f_temp = ScalarField(n, base=24.0, peak=68.0, n_src=2,
@@ -356,17 +413,22 @@ class DashViz:
         # ── 요구조자: 발견되는 순간 바로 지도에 표시하고, 이후로는
         #    RESCUE_REPLAN_EVERY 스텝마다 경로를 다시 계산한다. 탐사가
         #    진행될수록 grid/measured_t/g 커버리지가 넓어지므로, 경로도
-        #    같이 갱신돼야 처음엔 없던 우회로가 나중에 반영된다. ──
-        if S.rescuee_discovered:
-            if st.rescue_target is None:
-                st.rescue_target = S.rescuee_truth
-                print(f"[구조] 요구조자 발견! 위치 {S.rescuee_truth} "
-                      f"(스텝 {S.rescuee_discover_step})")
-                self._update_rescue_paths()
-                self._rescue_last_plan_step = S.step
-            elif S.step - self._rescue_last_plan_step >= self.RESCUE_REPLAN_EVERY:
-                self._update_rescue_paths()
-                self._rescue_last_plan_step = S.step
+        #    같이 갱신돼야 처음엔 없던 우회로가 나중에 반영된다.
+        #    여러 명일 수 있으므로 새로 발견된 사람이 있는지 매 스텝
+        #    확인하고, 있으면 그 즉시 재계산한다. ──
+        newly = [i for i, d in enumerate(S.rescuee_discovered)
+                if d and i not in self._rescue_known_idxs]
+        if newly:
+            for i in newly:
+                self._rescue_known_idxs.append(i)
+                print(f"[구조] 요구조자 발견! 위치 {S.rescuee_truths[i]} "
+                      f"(스텝 {S.rescuee_discover_step[i]})")
+            self._update_rescue_paths()
+            self._rescue_last_plan_step = S.step
+        elif self._rescue_known_idxs and \
+                S.step - self._rescue_last_plan_step >= self.RESCUE_REPLAN_EVERY:
+            self._update_rescue_paths()
+            self._rescue_last_plan_step = S.step
 
         st.pos = ((rx - S.GRID_SIZE / 2) * S.CELL_SIZE_M,
                   (ry - S.GRID_SIZE / 2) * S.CELL_SIZE_M)
@@ -414,16 +476,39 @@ class DashViz:
             if v > GAS_PPM:
                 out.append({"kind": "gas", "x": x, "y": y,
                             "r": 4 + (v - GAS_PPM) / 6, "level": (v - GAS_PPM) / 25})
+        # ★[성능] 예전엔 각 점마다 지금까지 만들어진 merged 얼룩 전부와
+        # 전수비교(O(n^2))했다 - _cluster_points 와 같은 이유로 후반부
+        # 렉의 원인 중 하나였다.
+        #
+        # ★★[주의] 이 병합은 _cluster_points 와 다른 알고리즘이다 -
+        # 전이적(transitive) 클러스터링이 아니라 "먼저 생긴 얼룩(앵커,
+        # 위치 고정)에 순서대로 합류"하는 1-pass 그리디 방식이다(앵커
+        # 위치는 그 얼룩의 첫 점 좌표에서 절대 안 움직인다 - A·B가
+        # 가깝고 B·C가 가까워도 A·C가 안 가까우면 C는 A의 얼룩에
+        # 합류하지 않는다). 그래서 공간 해시로 최적화할 때도 "가까운
+        # 후보만 추리기"까지만 쓰고, 후보들을 반드시 얼룩 생성 순서대로
+        # 검사해서 원본과 완전히 같은 결과(어떤 얼룩에 합류하는지, 위치가
+        # 어디로 고정되는지)가 나오게 한다. (틀렸던 첫 시도: 후보를
+        # union-find 로 전이적으로 묶었더니 원래는 따로 남아야 할 얼룩들이
+        # 하나로 합쳐지는 회귀가 났음 - 브루트포스 대조 테스트로 발견.)
         merged = []
+        anchor_buckets = {}   # (bx,by) -> [merged 인덱스, ...]
         for h in out:
-            for m in merged:
-                if m["kind"] == h["kind"] and \
-                        math.hypot(m["x"] - h["x"], m["y"] - h["y"]) < 9:
+            hx, hy = h["x"], h["y"]
+            bx, by = int(hx // 9), int(hy // 9)
+            cand = sorted(_bucket_neighbors(anchor_buckets, bx, by))
+            joined = False
+            for ai in cand:
+                m = merged[ai]
+                if math.hypot(m["x"] - hx, m["y"] - hy) < 9:
                     m["r"] = max(m["r"], h["r"])
                     m["level"] = max(m["level"], h["level"])
+                    joined = True
                     break
-            else:
+            if not joined:
+                idx = len(merged)
                 merged.append(dict(h))
+                anchor_buckets.setdefault((bx, by), []).append(idx)
 
         fire_cells = [(x, y, v) for (x, y), v in self.measured_t.items()
                     if v >= self.FIRE_CIRCLE_TEMP_C]
@@ -452,16 +537,19 @@ class DashViz:
         # 갱신한다 - 중간 갱신 주기(RESCUE_REPLAN_EVERY)에 걸려 최신이
         # 아닐 수 있는 경로를 최종 상태로 맞춘다. (_update_rescue_paths
         # 자체도 내부에서 예외를 잡으므로 여기선 따로 안 감싼다.)
-        if S.rescuee_discovered:
+        if any(S.rescuee_discovered):
             self._update_rescue_paths()
 
     def _update_rescue_paths(self):
-        """발견된 요구조자에 대해 두 경로(안전/위험감수)를 다시 계산해
-        state 에 반영한다. ★ S.grid(실제로 그린 지도)와 self.measured_t/g
-        (실제로 밟은 칸의 실측값)만 쓴다 - f_temp/f_gas.value_at() 은
-        로봇이 모르는 '정답'이라 여기서 참조하면 안 된다
-        (rescue_planner.py 상단 docstring, path_planner_sim2.py 의
-        정답/로봇로직 분리 원칙과 동일한 이유).
+        """지금까지 발견된 요구조자 각각에 대해 두 경로(안전/위험감수)를
+        다시 계산해 state 에 반영한다. ★ S.grid(실제로 그린 지도)와
+        self.measured_t/g(실제로 밟은 칸의 실측값)만 쓴다 -
+        f_temp/f_gas.value_at() 은 로봇이 모르는 '정답'이라 여기서
+        참조하면 안 된다(rescue_planner.py 상단 docstring, path_planner_sim2.py
+        의 정답/로봇로직 분리 원칙과 동일한 이유).
+
+        st.rescue_targets/rescue_paths_safe/rescue_paths_risky 는 서로 같은
+        순서/길이로 맞춘다(self._rescue_known_idxs 순서, 즉 발견된 순서).
 
         [방어] 이 함수는 S.run() 메인 루프와 같은 스레드에서 progress()를
         통해 호출된다. 여기서 예외가 새면 S.run() 전체가 죽고(_start_sim2
@@ -469,26 +557,32 @@ class DashViz:
         갱신도 안 와서 화면이 그대로 멈춘 것처럼 보인다 - 실제로
         rescue_planner.py 구버전(plan_rescue_paths 이전 이름)이 로컬에
         남아있어서 이 증상이 났었다. 원인이 뭐든(구버전 파일, 새 버그 등)
-        구조경로 계산 하나가 미션 전체를 멈추게 하면 안 되므로, 여기서
-        예외를 잡아 로그만 남기고 다음 스텝을 계속 진행한다. 경고는
-        RESCUE_REPLAN_EVERY 마다 계속 재시도되므로, 매번 다 찍으면 로그가
+        구조경로 계산 하나가 미션 전체를 멈추게 하면 안 되므로, 요구조자
+        한 명 계산에서 예외가 나도 그 사람만 빈 경로로 남기고 나머지는
+        계속 계산한다. 경고는 계속 재시도되므로, 매번 다 찍으면 로그가
         같은 줄로 도배된다 - 처음 한 번만 출력한다."""
         import rescue_planner as RP
         S, st = self.S, self.state
-        if S.rescuee_truth is None:
+        if not self._rescue_known_idxs:
             return
-        try:
-            path_safe, path_risky = RP.plan_rescue_paths(
-                S.grid, self.measured_t, self.measured_g, S.home, S.rescuee_truth)
-        except Exception as e:                      # noqa: BLE001
-            if not self._rescue_error_shown:
-                self._rescue_error_shown = True
-                print(f"[구조경로] 계산 중 오류 - 이후 계속 건너뜀(재계산은 "
-                      f"계속 시도됨, 로그는 이번만 출력): "
-                      f"{type(e).__name__}: {e}")
-            return
-        st.rescue_path_safe = path_safe or []
-        st.rescue_path_risky = path_risky or []
+        targets = [S.rescuee_truths[i] for i in self._rescue_known_idxs]
+        safe_list, risky_list = [], []
+        for t in targets:
+            try:
+                path_safe, path_risky = RP.plan_rescue_paths(
+                    S.grid, self.measured_t, self.measured_g, S.home, t)
+            except Exception as e:                  # noqa: BLE001
+                if not self._rescue_error_shown:
+                    self._rescue_error_shown = True
+                    print(f"[구조경로] 계산 중 오류 - 이후 계속 건너뜀(재계산은 "
+                          f"계속 시도됨, 로그는 이번만 출력): "
+                          f"{type(e).__name__}: {e}")
+                path_safe, path_risky = None, None
+            safe_list.append(path_safe or [])
+            risky_list.append(path_risky or [])
+        st.rescue_targets = targets
+        st.rescue_paths_safe = safe_list
+        st.rescue_paths_risky = risky_list
 
 
 def make_dash_viz(state, scale=8, grid_n=12):

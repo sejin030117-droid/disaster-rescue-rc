@@ -118,9 +118,9 @@ class RobotState:
     hazards:   list = field(default_factory=list)
     robot_cell: tuple | None = None
 
-    rescue_target:      tuple | None = None
-    rescue_path_safe:   list = field(default_factory=list)
-    rescue_path_risky:  list = field(default_factory=list)
+    rescue_targets:      list = field(default_factory=list)   # [(x,y), ...] 발견된 요구조자들
+    rescue_paths_safe:   list = field(default_factory=list)   # rescue_targets 와 같은 순서/길이
+    rescue_paths_risky:  list = field(default_factory=list)
 
     temp_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
     gas_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
@@ -352,16 +352,22 @@ class SimSource:
         s.push_history()
 
     def _hazards(self):
+        # ★[버그수정] 50/40 하드코딩 -> FIRE_TEMP_C/GAS_PPM. 이 파일 상단이
+        # 이미 robot_config 에서 단일 출처로 끌어온 값인데 mini 모드(sim2
+        # 로드 실패시 대체 경로)만 따로 놀고 있었다 - CLAUDE.md §2 인계
+        # 이슈와 같은 패턴.
         ex = self.ex
         out = []
         for (x, y), v in ex.measured_t.items():
-            if v > 50:
+            if v > FIRE_TEMP_C:
                 out.append({"kind": "fire", "x": x, "y": y,
-                            "r": 4 + (v - 50) / 6, "level": (v - 50) / 20})
+                            "r": 4 + (v - FIRE_TEMP_C) / 6,
+                            "level": (v - FIRE_TEMP_C) / 20})
         for (x, y), v in ex.measured_g.items():
-            if v > 40:
+            if v > GAS_PPM:
                 out.append({"kind": "gas", "x": x, "y": y,
-                            "r": 4 + (v - 40) / 6, "level": (v - 40) / 25})
+                            "r": 4 + (v - GAS_PPM) / 6,
+                            "level": (v - GAS_PPM) / 25})
         merged = []
         for h in out:
             for m in merged:
@@ -385,8 +391,11 @@ class SimSource:
         return ex.scan_range
 
     def _detect(self, s):
-        if s.temp_c is not None and s.temp_c > 45:
-            conf = min(0.99, 0.5 + (s.temp_c - 45) / 40)
+        # ★[버그수정] 45 하드코딩 -> FIRE_TEMP_C(50). 임계값이 카드/지도/
+        # 경로회피와 따로 놀면 "카드는 정상인데 왜 이게 뜨지?" 류 혼란이
+        # 생긴다(§8-3 단일 출처화 원칙, dashboard.py 상단 주석 참고).
+        if s.temp_c is not None and s.temp_c > FIRE_TEMP_C:
+            conf = min(0.99, 0.5 + (s.temp_c - FIRE_TEMP_C) / 40)
             heading = self.S2.robot_angle if self.mode == "sim2" else self.ex.heading
             return [{"label": "FIRE", "conf": conf,
                      "dist_m": (s.dist_mm or 0) / 1000,
@@ -521,9 +530,15 @@ class HeatGrid(QWidget):
         # 폰트 크기로는 숫자가 옆 칸까지 번져 안 읽힌다(GRID_N=20으로
         # 올렸을 때 실측 확인됨). 셀 크기에 비례해 폰트를 줄이고, 그래도
         # 못 들어갈 만큼 좁으면(11px 미만) 숫자를 생략하고 색상만 보여준다.
-        pt = max(4, min(7, int(s * 0.32)))
-        f = QFont(); f.setPointSize(pt); p.setFont(f)
-        show_text = s >= 8
+        # ★setPointSize는 Windows 고배율 DPI 환경에서 실제 렌더링 픽셀
+        # 크기가 사실상 0에 가깝게 줄어들어 숫자가 안 보이는 문제가 있었다.
+        # setPixelSize는 DPI와 무관하게 항상 지정한 픽셀 수로 그려진다.
+        px = max(7, min(13, int(s * 0.55)))
+        f = QFont(); f.setPixelSize(px); p.setFont(f)
+        # ★px가 이미 최소 7로 바닥을 잡아주므로, 여기 컷오프는 정말
+        # 못 그릴 정도로 좁을 때만 걸러내면 된다(예전 8은 옛 포인트
+        # 크기 공식 기준이라 지금 공식에서는 너무 쉽게 걸렸다).
+        show_text = s >= 5
 
         for r in range(n):
             for c in range(n):
@@ -555,7 +570,7 @@ class HeatGrid(QWidget):
         for i in range(W):
             p.fillRect(i, int(by), 1, 8, self._color(i / max(W - 1, 1)))
         p.setPen(QColor(TEXT_DIM))
-        f.setPointSize(6); p.setFont(f)
+        f.setPixelSize(11); p.setFont(f)
         p.drawText(1, int(by) + 7, self.fmt.format(self.vmin))
         p.drawText(W - 26, int(by) + 7, self.fmt.format(self.vmax))
         p.end()
@@ -563,7 +578,10 @@ class HeatGrid(QWidget):
 class CameraView(QLabel):
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(130)   # ★ 220 -> 130. 카메라 실물이 없어 노이즈
+                                     #   텍스처만 채우는 자리라, 이 최소값이
+                                     #   커서 그리드(히트맵) stretch 비율을
+                                     #   먹어버리고 있었다 - 실측 확인됨.
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(f"background:#05070a; border-radius:8px;")
         self._pm = None
@@ -759,7 +777,9 @@ class Dashboard(QWidget):
         bottom = QHBoxLayout(); bottom.setSpacing(10)
 
         c3, l3 = card("시스템 상태")
-        c3.setMinimumHeight(180)   # ★ 비중 축소돼도 항목 7개가 안 찌그러지게
+        c3.setMinimumHeight(140)   # ★ 180 -> 140. 항목 7개가 안 찌그러지는
+                                   #   선에서 더 낮춰 그리드 쪽에 공간을 더
+                                   #   준다 - 실측 확인됨.
         self.rows = {}
         for name in self.state.modules:
             r = StatusRow(name); self.rows[name] = r; l3.addWidget(r)
@@ -767,7 +787,7 @@ class Dashboard(QWidget):
         bottom.addWidget(c3)
 
         c4, l4 = card("경로 계획 정보")
-        c4.setMinimumHeight(180)   # ★ 시스템상태 카드와 동일한 최소 높이
+        c4.setMinimumHeight(140)   # ★ 시스템상태 카드와 동일한 최소 높이
         self.lbl_goal   = QLabel(); self.lbl_pos = QLabel()
         self.lbl_remain = QLabel(); self.lbl_eta = QLabel()
         self.lbl_pstat  = QLabel()
@@ -809,9 +829,9 @@ class Dashboard(QWidget):
             self.map_canvas.show(); self.map_view.hide()
             self.map_canvas.set_data(s.map_grid, s.robot_cell, s.heading,
                                      s.trail, s.plan_path, s.hazards,
-                                     rescue_target=s.rescue_target,
-                                     rescue_path_safe=s.rescue_path_safe,
-                                     rescue_path_risky=s.rescue_path_risky)
+                                     rescue_targets=s.rescue_targets,
+                                     rescue_paths_safe=s.rescue_paths_safe,
+                                     rescue_paths_risky=s.rescue_paths_risky)
         else:
             self.map_canvas.hide(); self.map_view.show()
             self.map_view.update_map(s.map_image)
@@ -856,19 +876,27 @@ class Dashboard(QWidget):
         self.lbl_phase.setText(f"단계 : {s.phase}  (스텝 {s.step})")
         self.lbl_phase.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
 
-        if s.rescue_target is None:
+        if not s.rescue_targets:
             self.lbl_rescue.setText("요구조자 : 미발견")
             self.lbl_rescue.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         else:
-            tx, ty = s.rescue_target
-            lines = [f"요구조자 발견 : ({tx}, {ty})"]
-            lines.append(f"안전 경로 : {len(s.rescue_path_safe)}칸"
-                        if s.rescue_path_safe else "안전 경로 : 없음")
-            lines.append(f"위험감수 경로(가스 경유) : {len(s.rescue_path_risky)}칸"
-                        if s.rescue_path_risky else "위험감수 경로 : 없음")
+            lines = []
+            any_safe = False
+            any_risky_only = False
+            for i, (tx, ty) in enumerate(s.rescue_targets):
+                safe = s.rescue_paths_safe[i] if i < len(s.rescue_paths_safe) else []
+                risky = s.rescue_paths_risky[i] if i < len(s.rescue_paths_risky) else []
+                lines.append(f"요구조자{i+1} 발견 : ({tx}, {ty})")
+                lines.append(f"  안전 경로 : {len(safe)}칸"
+                            if safe else "  안전 경로 : 없음")
+                lines.append(f"  위험감수 경로(가스 경유) : {len(risky)}칸"
+                            if risky else "  위험감수 경로 : 없음")
+                if safe:
+                    any_safe = True
+                elif risky:
+                    any_risky_only = True
             self.lbl_rescue.setText("\n".join(lines))
-            color = OK if s.rescue_path_safe else (
-                WARN if s.rescue_path_risky else DANGER)
+            color = OK if any_safe else (WARN if any_risky_only else DANGER)
             self.lbl_rescue.setStyleSheet(f"color:{color}; font-size:12px;")
 
 

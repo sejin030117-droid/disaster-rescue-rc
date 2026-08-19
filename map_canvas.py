@@ -146,9 +146,9 @@ class MapCanvas(QWidget):
         self.trail = []
         self.path = []
         self.hazards = []            # [{"kind","x","y","r","level"}]
-        self.rescue_target = None    # (x, y) 셀 좌표
-        self.rescue_path_safe = []   # [(x,y), ...] 안전 경로 (고온+가스 회피)
-        self.rescue_path_risky = []  # [(x,y), ...] 위험감수 경로 (가스 경유)
+        self.rescue_targets = []      # [(x,y), ...] 발견된 요구조자들의 셀 좌표
+        self.rescue_paths_safe = []   # rescue_targets 와 같은 순서 - 안전 경로 (고온+가스 회피)
+        self.rescue_paths_risky = []  # rescue_targets 와 같은 순서 - 위험감수 경로 (가스 경유)
         self._cache_key = None
         self._polys = {}
         self._hazard_cache_key = None
@@ -157,17 +157,17 @@ class MapCanvas(QWidget):
         self.LEGEND_H = self.LEGEND_PAD_TOP + self.LEGEND_ROW_H   # 첫 프레임 전 기본값
 
     def set_data(self, grid, robot=None, heading=0.0, trail=None,
-                 path=None, hazards=None, rescue_target=None,
-                 rescue_path_safe=None, rescue_path_risky=None):
+                 path=None, hazards=None, rescue_targets=None,
+                 rescue_paths_safe=None, rescue_paths_risky=None):
         self.grid = np.asarray(grid)
         self.robot = robot
         self.heading = heading
         self.trail = trail or []
         self.path = path or []
         self.hazards = hazards or []
-        self.rescue_target = rescue_target
-        self.rescue_path_safe = rescue_path_safe or []
-        self.rescue_path_risky = rescue_path_risky or []
+        self.rescue_targets = rescue_targets or []
+        self.rescue_paths_safe = rescue_paths_safe or []
+        self.rescue_paths_risky = rescue_paths_risky or []
         self.update()
 
     # ---- 좌표 변환 ------------------------------------------------
@@ -434,12 +434,20 @@ class MapCanvas(QWidget):
         p.drawEllipse(pts[-1], 4, 4)
 
     def _draw_rescue(self, p):
-        """요구조자 위치(SOS 마커) + 두 후보 경로(안전/위험감수).
+        """요구조자(들) 위치(SOS 마커) + 각자의 두 후보 경로(안전/위험감수).
+
+        요구조자가 여러 명일 수 있다 - rescue_targets/rescue_paths_safe/
+        rescue_paths_risky 는 항상 같은 순서/길이로 짝지어 온다(발견된 순서,
+        sim_bridge.DashViz._update_rescue_paths 참고). 색은 인원 수와
+        무관하게 항상 동일(안전=C_RESCUE_SAFE, 위험감수=C_RESCUE_RISKY) -
+        구분은 색이 아니라 마커에 붙는 번호(SOS 1, SOS 2, ...)로 한다.
 
         계획 경로(_draw_path, 초록 실선 - 탐사 중 다음 프런티어로 가는 경로)와
         용도가 다르므로 색/선 스타일을 확실히 구분한다(점선) - 둘 다
-        초록 계열이면 화면에서 헷갈린다. 안전경로를 위험감수경로보다
-        나중에(위에) 그려서 겹칠 때 안전경로가 우선적으로 보이게 한다."""
+        초록 계열이면 화면에서 헷갈린다. 모든 요구조자의 경로선을 먼저
+        그리고 SOS 마커는 그 위에 나중에 그려서, 마커가 다른 사람의
+        경로선에 가리지 않게 한다. 안전경로를 위험감수경로보다 나중에
+        그려서 겹칠 때 안전경로가 우선적으로 보이게 한다(각자 내부에서도)."""
         def draw_line(cells, color):
             if len(cells) < 2:
                 return
@@ -452,18 +460,23 @@ class MapCanvas(QWidget):
                 path.lineTo(q)
             p.drawPath(path)
 
-        draw_line(self.rescue_path_risky, C_RESCUE_RISKY)
-        draw_line(self.rescue_path_safe, C_RESCUE_SAFE)
+        for i in range(len(self.rescue_targets)):
+            risky = self.rescue_paths_risky[i] if i < len(self.rescue_paths_risky) else []
+            safe = self.rescue_paths_safe[i] if i < len(self.rescue_paths_safe) else []
+            draw_line(risky, C_RESCUE_RISKY)
+            draw_line(safe, C_RESCUE_SAFE)
 
-        if self.rescue_target is not None:
-            c = self._pt(*self.rescue_target)
+        multi = len(self.rescue_targets) > 1
+        for i, target in enumerate(self.rescue_targets):
+            c = self._pt(*target)
             p.setPen(QPen(QColor("#ffffff"), 1.4))
             p.setBrush(QBrush(C_RESCUE_MARK))
             p.drawEllipse(c, 7, 7)
             f = QFont(); f.setPointSize(7); f.setBold(True); p.setFont(f)
             p.setPen(C_RESCUE_MARK)
+            label = f"SOS {i + 1}" if multi else "SOS"
             p.drawText(QRectF(c.x() - 22, c.y() - 22, 44, 14),
-                      Qt.AlignCenter, "SOS")
+                      Qt.AlignCenter, label)
 
     def _draw_robot(self, p):
         if not self.robot:
