@@ -895,25 +895,35 @@ def _ray_sees_rescuee(rx, ry, angle_deg, max_range, tx, ty, tol=RESCUEE_DETECT_T
     return True
 
 
-def _check_rescuee_detection(rx, ry, angle_deg, max_range):
+def _check_rescuee_detection(g, rx, ry, angle_deg, max_range):
     """이번 광선이 아직 못 찾은 요구조자를 스쳤으면 발견 처리한다.
     real_scan() 이 호출될 때마다(=실제 센서가 그 방향을 스캔할 때마다)
     확인한다 - 로봇이 실제로 그 방향을 스캔해야만 발견되게 하기 위해서다
     (§1-12 참고: 정답 위치 자체는 여전히 여기서만, '지금 보이는가'
-    판정에만 쓰고 로봇 로직 다른 곳엔 넘기지 않는다)."""
+    판정에만 쓰고 로봇 로직 다른 곳엔 넘기지 않는다).
+
+    ★[버그수정 - 사용자 실기 테스트에서 발견] 발견되는 순간 그 칸을
+    observe_cell() 로 '확인된 빈 칸'(0)으로 지도에도 반영한다. 예전엔
+    가림 판정만 하고 grid 는 안 건드려서, 실제로 시야가 뚫려 발견에는
+    성공했는데 지도상으론 그 자리가 여전히 미탐색(회색)으로 남아 SOS
+    마커가 "안 밝혀진 곳에 갑자기 나타난" 것처럼 보였다. 발견 자체가
+    '그 칸이 사람이 서 있을 수 있는 빈 공간'이라는 실측 증거이므로,
+    이건 정답을 몰래 넘기는 게 아니라 실제로 관측된 사실을 기록하는
+    것이다."""
     for i, (tx, ty) in enumerate(rescuee_truths):
         if rescuee_discovered[i]:
             continue
         if _ray_sees_rescuee(rx, ry, angle_deg, max_range, tx, ty):
             rescuee_discovered[i] = True
             rescuee_discover_step[i] = step
+            observe_cell(g, tx, ty, False)
 
 
 def real_scan(g, rx, ry, angle_deg, max_range=SCAN_RANGE):
     global rays_fired
     rays_fired += 1
     if rescuee_truths:
-        _check_rescuee_detection(rx, ry, angle_deg, max_range)
+        _check_rescuee_detection(g, rx, ry, angle_deg, max_range)
 
     if USE_CONE_MODEL:
         hit_cell, dist = _cone_min_distance(rx, ry, angle_deg, max_range)

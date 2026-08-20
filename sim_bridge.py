@@ -26,6 +26,7 @@ sim_bridge.py — 탐사 시뮬레이터를 대시보드 2D 맵에 연결
 from __future__ import annotations
 import math
 import random
+import threading
 import time
 
 import numpy as np
@@ -297,6 +298,13 @@ class DashViz:
     state = None          # make_dash_viz 가 채운다
     scale = 8
     grid_n = 12           # 대시보드 히트맵 격자 크기
+    # ★일시정지 신호. set = 진행, clear = 정지. progress() 가 매 스텝 여기서
+    #   기다리므로 화면만 멈추는 게 아니라 시뮬 스레드가 그 자리에 멈춘다
+    #   (재개하면 멈춘 지점부터 이어짐 - 건너뛴 구간이 없다).
+    #   ★인스턴스가 아니라 클래스 속성인 이유: _Viz 인스턴스는 S.run() 이
+    #   내부에서 만들어 밖에서 못 잡는다. make_dash_viz 가 만드는 바인딩
+    #   서브클래스마다 별도 Event 를 넣어주므로 대시보드가 이걸로 제어한다.
+    pause_event = None
     min_interval_s = 0.08  # ★ 이 이상 빠르게는 갱신 안 함 (대략 12Hz 상한)
     RESCUE_REPLAN_EVERY = 5   # 요구조자 발견 후 이 스텝마다 경로 재계산
     FIRE_CIRCLE_TEMP_C = FIRE_TEMP_C  # ★불(원) 표시 임계값.
@@ -349,6 +357,8 @@ class DashViz:
         #   훨씬 빠르게 여러 번 progress() 를 부를 수 있다 — 그 초과분은
         #   화면에 반영도 안 되고 GIL 만 뺏는 순수 낭비다.
         #   여기서 최소 간격만큼 쉬어주면 GIL 이 자연히 Qt 스레드로 넘어간다.
+        if self.pause_event is not None:
+            self.pause_event.wait()   # 일시정지 중이면 여기서 시뮬 스레드가 대기
         now = time.perf_counter()
         if now - self._last_update < self.min_interval_s:
             time.sleep(max(0.0, self.min_interval_s - (now - self._last_update)))
@@ -438,6 +448,7 @@ class DashViz:
             st.remain_m = math.hypot(target[0] - rx, target[1] - ry) * S.CELL_SIZE_M
             st.eta_s = st.remain_m / max(S.ROBOT_SPEED_MPS, 1e-6)
         st.path_ok = (S.collisions == 0)
+        st.collisions = S.collisions
         st.phase = S.phase
         st.step = S.step
         st.push_history()
@@ -587,8 +598,11 @@ class DashViz:
 
 def make_dash_viz(state, scale=8, grid_n=12):
     """state 를 묶은 _Viz 서브클래스를 만들어 반환."""
+    ev = threading.Event()
+    ev.set()          # 기본은 '진행'
     return type("BoundDashViz", (DashViz,),
-                {"state": state, "scale": scale, "grid_n": grid_n})
+                {"state": state, "scale": scale, "grid_n": grid_n,
+                 "pause_event": ev})
 
 
 # ═══════════════════════════════════════════════════════════════

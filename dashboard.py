@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QFont, QPen
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QFrame,
                                QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QSizePolicy, QPushButton)
+                               QSizePolicy, QPushButton, QProgressBar)
 import pyqtgraph as pg
 from map_canvas import MapCanvas
 
@@ -90,6 +90,18 @@ QLabel#topTitle {{
 
 GRID_N = 20
 
+# ★시뮬레이션 시드 - 여기가 유일한 출처다(dashboard_ex.py 도 이 값을 쓴다).
+#   31 을 쓰는 이유: 요구조자로 가는 두 경로(안전/위험감수)가 실제로 서로
+#   다른 길로 갈라지는 시드다. 대부분의 시드는 가스 위험구역이 화재 원과
+#   겹쳐 있어서, 가스만 허용해주는 위험감수 경로가 결국 불에 막혀 안전
+#   경로와 똑같은 길이 된다(두 색 점선이 완전히 포개져 보임 -
+#   rescue_planner.plan_rescue_paths 참고: risky 는 가스만 뚫어주고 불은
+#   safe 와 똑같이 막는다). 31 은 가스 얼룩이 불과 안 겹치는 자리에 있어
+#   위험감수 경로가 실제로 지름길이 된다.
+#   ★값을 바꾸기 전에 두 경로가 갈라지는지 먼저 확인할 것 - 안 갈라지는
+#   시드로 바꾸면 "구조경로 2개" 기능이 화면상 사라진 것처럼 보인다.
+SIM_SEED = 31
+
 
 def sensor_level(v, warn, danger):
     if v is None:
@@ -99,6 +111,18 @@ def sensor_level(v, warn, danger):
     if v >= warn:
         return "경계(주의)", WARN
     return "정상", OK
+
+
+def dist_conf_color(conf):
+    """ToF 신뢰도가 낮으면(값을 못 믿을 수준) 경고색을 준다. 온도/가스
+    카드처럼 3단계로 색이 바뀌는 것과 달리, 거리는 값 자체가 아니라
+    신뢰도가 낮을 때만 경고하면 되므로 정상 구간은 None(카드 기본색
+    유지)을 반환한다."""
+    if conf < 0.5:
+        return DANGER
+    if conf < 0.8:
+        return WARN
+    return None
 
 
 @dataclass
@@ -135,6 +159,7 @@ class RobotState:
 
     phase: str = "-"
     step:  int = 0
+    collisions: int = 0
 
     modules: dict = field(default_factory=lambda: {
         "ESP32": False, "Raspberry Pi": False, "카메라": False,
@@ -190,14 +215,15 @@ class FrameGrabber:
             self.cap.release()
 
 class SimSource:
-    def __init__(self, state: RobotState, seed=11, live_cam=False):
+    def __init__(self, state: RobotState, seed=SIM_SEED, live_cam=False):
         import sim_bridge as B
         self.B = B
         self.s = state
         self.t = 0.0
-        self.rng = np.random.default_rng(seed)
-        self.live_cam = live_cam 
+        self.live_cam = live_cam
         self.cam_running = True
+        self.paused = False
+        self._viz_cls = None
         
         for k in self.s.modules:
             self.s.modules[k] = True
@@ -229,6 +255,7 @@ class SimSource:
         self.mode = "sim2"
         self.S2 = S2
         S2._Viz = B.make_dash_viz(self.s, grid_n=GRID_N)
+        self._viz_cls = S2._Viz   # 일시정지 신호(pause_event)를 들고 있는 클래스
 
         def _run():
             try:
@@ -299,7 +326,19 @@ class SimSource:
         grab.stop()
         print("[카메라] 백그라운드 스레드 정상 종료됨")
 
+    def set_paused(self, paused):
+        """일시정지/재개. sim2 모드는 시뮬 스레드를 progress() 안에서 실제로
+        멈춰 세우고(건너뛰는 구간 없음), mini 모드는 tick 을 건너뛴다."""
+        self.paused = paused
+        if self._viz_cls is not None and self._viz_cls.pause_event is not None:
+            if paused:
+                self._viz_cls.pause_event.clear()
+            else:
+                self._viz_cls.pause_event.set()
+
     def tick(self, dt=0.1):
+        if self.paused:
+            return
         if self.mode == "sim2":
             self._tick_sim2(dt)
         else:
@@ -309,7 +348,7 @@ class SimSource:
         s = self.s
         self.t += dt
         if not self.live_cam:
-            s.frame = self._fake_cam()
+            s.frame = None
             s.detections = self._detect(s)
         s.battery_pct = max(5, 92 - int(self.t / 6))
 
@@ -347,7 +386,7 @@ class SimSource:
         s.battery_pct = max(5, 92 - int(self.t / 6))
         
         if not self.live_cam:
-            s.frame = self._fake_cam()
+            s.frame = None
             s.detections = self._detect(s)
         s.push_history()
 
@@ -403,18 +442,10 @@ class SimSource:
                      "box": (300, 60, 130, 150)}]
         return []
 
-    def _fake_cam(self):
-        h, w, t = 300, 520, self.t
-        yy, xx = np.mgrid[0:h, 0:w]
-        f = np.zeros((h, w, 3), np.uint8)
-        f[..., 0] = (26 + 18 * np.sin(xx / 95 + t)).clip(0, 255)
-        f[..., 1] = (30 + 14 * np.cos(yy / 75 - t * .6)).clip(0, 255)
-        f[..., 2] = (36 + 12 * np.sin((xx + yy) / 120)).clip(0, 255)
-        return (f + self.rng.normal(0, 3, f.shape)).clip(0, 255).astype(np.uint8)
-
     def stop(self):
         self.done = True
         self.cam_running = False
+        self.set_paused(False)   # 일시정지 중 종료하면 시뮬 스레드가 wait 에 갇힌다
 
 def card(title: str | None = None) -> tuple[QFrame, QVBoxLayout]:
     f = QFrame(); f.setObjectName("card")
@@ -469,8 +500,7 @@ class MetricCard(QFrame):
         self.sub.setText(sub)
         self.sub.setStyleSheet(
             f"color:{c if level_color else TEXT_DIM}; font-size:11px;")
-        if level_color:
-            self.curve.setPen(pg.mkPen(level_color, width=2))
+        self.curve.setPen(pg.mkPen(level_color or self.color, width=2))
         if hist:
             arr = np.asarray(hist, float)
             self.curve.setData(np.arange(len(arr)), arr)
@@ -533,7 +563,7 @@ class HeatGrid(QWidget):
         # ★setPointSize는 Windows 고배율 DPI 환경에서 실제 렌더링 픽셀
         # 크기가 사실상 0에 가깝게 줄어들어 숫자가 안 보이는 문제가 있었다.
         # setPixelSize는 DPI와 무관하게 항상 지정한 픽셀 수로 그려진다.
-        px = max(7, min(13, int(s * 0.55)))
+        px = max(8, min(15, int(s * 0.9)))
         f = QFont(); f.setPixelSize(px); p.setFont(f)
         # ★px가 이미 최소 7로 바닥을 잡아주므로, 여기 컷오프는 정말
         # 못 그릴 정도로 좁을 때만 걸러내면 된다(예전 8은 옛 포인트
@@ -583,15 +613,18 @@ class CameraView(QLabel):
                                      #   커서 그리드(히트맵) stretch 비율을
                                      #   먹어버리고 있었다 - 실측 확인됨.
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet(f"background:#05070a; border-radius:8px;")
+        self.setStyleSheet(f"background:#05070a; border-radius:8px; color:{TEXT_DIM};")
         self._pm = None
         self._dets = []
-        self._current_rgb = None 
+        self._current_rgb = None
+        self.none_text = "영상 없음"   # 실물 카메라 연결 실패용 기본 문구.
+                                       # 시뮬레이션 모드에서는 Dashboard 가
+                                       # "시뮬레이션 모드 - 카메라 비활성"로 바꿔준다.
 
     def update_frame(self, frame_bgr, detections):
         self._dets = detections or []
         if frame_bgr is None:
-            self.setText("영상 없음")
+            self.setText(self.none_text)
             return
             
         self._current_rgb = frame_bgr[..., ::-1].copy()
@@ -627,10 +660,12 @@ class MapView(QLabel):
         self.setStyleSheet("background:#05070a; border-radius:8px;")
         self.setMinimumSize(320, 320)
         self._pm = None
+        self.none_text = "지도 없음"   # CameraView 와 같은 패턴 - 시작 전에는
+                                       # Dashboard 가 "대기 중" 문구로 바꿔준다
 
     def update_map(self, arr):
         if arr is None:
-            self.setText("지도 없음")
+            self.setText(self.none_text)
             return
         arr = np.ascontiguousarray(arr)
         h, w, _ = arr.shape
@@ -662,22 +697,33 @@ class StatusRow(QWidget):
 
 class Dashboard(QWidget):
 
-    def __init__(self, state: RobotState, source=None):
+    def __init__(self, state: RobotState, source=None, start_callback=None):
         super().__init__()
         self.state = state
         self.source = source
+        # ★start_callback 이 있으면 "시작" 버튼을 누르기 전까지 시뮬레이션을
+        # 만들지도, 타이머를 돌리지도 않는다. source 를 직접 넘겨서 만들면
+        # (start_callback 없이) 예전처럼 곧바로 동작한다 - 기존 호출부 호환.
+        self.start_callback = start_callback
+        self.started = source is not None
         self.setWindowTitle("Disaster Exploration Robot")
         self.resize(1440, 900)
         self.setStyleSheet(QSS)
         self._build()
 
+        self._t0 = time.time()        # 미션 경과시간 기준점
+
         from PySide6.QtGui import QShortcut, QKeySequence
         QShortcut(QKeySequence("G"), self, activated=self._toggle_cells)
         QShortcut(QKeySequence("L"), self, activated=self._toggle_legend)
+        QShortcut(QKeySequence("Space"), self, activated=self._toggle_pause)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
-        self.timer.start(100)          
+        if self.started:
+            self.timer.start(100)
+        else:
+            self._refresh()            # 시작 전에도 대기 화면은 한 번 그려둔다
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -697,9 +743,49 @@ class Dashboard(QWidget):
         t = QLabel("DISASTER EXPLORATION ROBOT"); t.setObjectName("topTitle")
         self.lbl_online = QLabel("\u25cf SYSTEM OFFLINE")
         self.lbl_online.setStyleSheet(f"color:{DANGER};")
+        # ★요구조자 발견 배너 - 미션에서 가장 중요한 이벤트인데 예전엔
+        #   우측 하단 텍스트만 조용히 바뀌어 놓치기 쉬웠다.
+        self.lbl_alert = QLabel("")
+        self.lbl_alert.setStyleSheet(
+            f"background:{DANGER}; color:white; font-weight:bold;"
+            f"border-radius:4px; padding:3px 10px;")
+        self.lbl_alert.hide()
+
+        self.lbl_elapsed = QLabel("경과 --:--")
+        self.lbl_elapsed.setStyleSheet(f"color:{TEXT_DIM};")
         self.lbl_clock = QLabel("--:--:--"); self.lbl_clock.setStyleSheet(f"color:{TEXT_DIM};")
         self.lbl_batt = QLabel("BATTERY --%")
-        
+
+        self.btn_start = QPushButton("시작")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        self.btn_start.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT};
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 4px 14px;
+            }}
+            QPushButton:hover {{ background-color: #4c93ff; }}
+        """)
+        self.btn_start.clicked.connect(self._on_start_clicked)
+        self.btn_start.setVisible(not self.started)
+
+        self.btn_pause = QPushButton("일시정지")
+        self.btn_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_pause.setEnabled(self.started)
+        self.btn_pause.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {PANEL};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 4px 12px;
+            }}
+            QPushButton:hover {{ background-color: #21262d; }}
+        """)
+        self.btn_pause.clicked.connect(self._toggle_pause)
+
         self.btn_quit = QPushButton("시스템 종료")
         self.btn_quit.setCursor(Qt.PointingHandCursor)
         self.btn_quit.setStyleSheet(f"""
@@ -715,10 +801,14 @@ class Dashboard(QWidget):
         self.btn_quit.clicked.connect(self.close) 
 
         lay.addWidget(t); lay.addSpacing(24)
-        lay.addWidget(self.lbl_online); lay.addStretch()
+        lay.addWidget(self.lbl_online); lay.addSpacing(16)
+        lay.addWidget(self.lbl_alert); lay.addStretch()
+        lay.addWidget(self.lbl_elapsed); lay.addSpacing(20)
         lay.addWidget(self.lbl_clock); lay.addSpacing(20)
         lay.addWidget(self.lbl_batt); lay.addSpacing(20)
-        lay.addWidget(self.btn_quit) 
+        lay.addWidget(self.btn_start); lay.addSpacing(8)
+        lay.addWidget(self.btn_pause); lay.addSpacing(8)
+        lay.addWidget(self.btn_quit)
         return f
 
     def closeEvent(self, event):
@@ -729,33 +819,72 @@ class Dashboard(QWidget):
 
     def _left(self):
         col = QVBoxLayout(); col.setSpacing(10)
+        self._build_map_card(col)
+        self._build_sensor_card(col)
+        return col
 
+    def _build_map_card(self, col):
         c, lay = card("2D EXPLORATION MAP")
         self.map_canvas = MapCanvas(cell_m=0.05)
         self.map_view = MapView()
         self.map_view.hide()
+        if not self.started:
+            self.map_view.none_text = "대기 중 - 시작 버튼을 눌러주세요"
         lay.addWidget(self.map_canvas, 1)
         lay.addWidget(self.map_view, 1)
+
+        # ★탐사 진행률 - map_grid 의 미탐색(-1) 비율에서 바로 나오는 값인데
+        #   예전엔 "스텝 N"만 있어서 얼마나 남았는지 알 방법이 없었다.
+        prog_row = QHBoxLayout(); prog_row.setSpacing(8)
+        self.prog_explore = QProgressBar()
+        self.prog_explore.setRange(0, 100)
+        self.prog_explore.setTextVisible(False)
+        self.prog_explore.setFixedHeight(8)
+        self.prog_explore.setStyleSheet(f"""
+            QProgressBar {{ background:{BG}; border:1px solid {BORDER};
+                            border-radius:4px; }}
+            QProgressBar::chunk {{ background:{ACCENT}; border-radius:3px; }}
+        """)
+        self.lbl_explore = QLabel("탐사 --%")
+        self.lbl_explore.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
+        self.lbl_explore.setFixedWidth(96)
+        prog_row.addWidget(self.lbl_explore)
+        prog_row.addWidget(self.prog_explore, 1)
+        lay.addLayout(prog_row)
+
+        # ★단축키가 있는지조차 알 수 없었다 - 화면에 명시.
+        hint = QLabel("G 격자  ·  L 범례  ·  Space 일시정지")
+        hint.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px;")
+        hint.setAlignment(Qt.AlignRight)
+        lay.addWidget(hint)
+
         col.addWidget(c, 3)
 
+    def _build_sensor_card(self, col):
         c2, lay2 = card("센서 데이터")
         row = QHBoxLayout(); row.setSpacing(10)
         self.m_dist  = MetricCard("거리 (ToF)", "m",   ACCENT)
         self.m_temp  = MetricCard("온도",       "\u00b0C", DANGER)
         self.m_gas   = MetricCard("가스",       "ppm", WARN)
-        self.m_humid = MetricCard("습도",       "%",   OK,
-                                  none_text="센서 미설치")
-        for m in (self.m_dist, self.m_temp, self.m_gas, self.m_humid):
+        # ★습도 카드 제거 - 센서가 아예 없어 항상 "센서 미설치"만 띄우고
+        #   자리만 차지했다. 센서를 달면 MetricCard 한 줄과 _refresh 의
+        #   update_value 한 줄만 되살리면 된다.
+        for m in (self.m_dist, self.m_temp, self.m_gas):
             row.addWidget(m)
         lay2.addLayout(row)
         col.addWidget(c2, 1)
-        return col
 
     def _right(self):
         col = QVBoxLayout(); col.setSpacing(10)
 
         c, lay = card("카메라 영상 (실시간)")
         self.cam = CameraView()
+        if not self.started:
+            # ★시작 버튼을 누르기 전에는 소스가 아직 없으므로 "대기 중"임을
+            #   보여준다 - _on_start_clicked 에서 실제 모드에 맞게 갱신한다.
+            self.cam.none_text = "대기 중 - 시작 버튼을 눌러주세요"
+        elif not (self.source and getattr(self.source, "live_cam", False)):
+            self.cam.none_text = "시뮬레이션 모드 - 카메라 비활성"
         lay.addWidget(self.cam, 1)
         self.det_line = QLabel("탐지 없음")
         self.det_line.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
@@ -765,10 +894,13 @@ class Dashboard(QWidget):
 
         grids = QHBoxLayout(); grids.setSpacing(10)
         c1, l1 = card("온도 맵 (\u00b0C)")
-        self.heat_t = HeatGrid(25, 60)
+        # ★컬러바 상한을 FIRE_TEMP_C/GAS_PPM 기준으로 계산한다(기존
+        # 25~60/0~60 하드코딩과 지금 값은 같지만, 이제 임계값을 바꾸면
+        # 같이 따라간다) - §8-3 단일 출처화와 같은 이유.
+        self.heat_t = HeatGrid(25, FIRE_TEMP_C + 10)
         l1.addWidget(self.heat_t); grids.addWidget(c1)
         c2, l2 = card("가스 농도 맵 (ppm)")
-        self.heat_g = HeatGrid(0, 60)
+        self.heat_g = HeatGrid(0, GAS_PPM + 20)
         l2.addWidget(self.heat_g); grids.addWidget(c2)
         col.addLayout(grids, 5)   # ★ 히트맵 비중 확대 (3→5) - 세분화된
                                   #   해상도(GRID_N=20)를 살리려면 더 큰
@@ -784,10 +916,13 @@ class Dashboard(QWidget):
         for name in self.state.modules:
             r = StatusRow(name); self.rows[name] = r; l3.addWidget(r)
         l3.addStretch()
-        bottom.addWidget(c3)
+        bottom.addWidget(c3, 1)
 
         c4, l4 = card("경로 계획 정보")
-        c4.setMinimumHeight(140)   # ★ 시스템상태 카드와 동일한 최소 높이
+        c4.setMinimumHeight(170)   # ★ 140 -> 170. 고정 6줄 + 요구조자 줄이
+                                   #   들어갈 최소치(실측: 2명까지 안 잘림)
+        l4.setSpacing(2)           # ★ 기본 8 은 줄이 8개라 간격만 56px 를
+                                   #   먹어 정작 글자가 잘렸다(실측).
         self.lbl_goal   = QLabel(); self.lbl_pos = QLabel()
         self.lbl_remain = QLabel(); self.lbl_eta = QLabel()
         self.lbl_pstat  = QLabel()
@@ -798,13 +933,54 @@ class Dashboard(QWidget):
             l4.addWidget(w)
         self.lbl_rescue = QLabel("요구조자 : 미발견")
         self.lbl_rescue.setWordWrap(True)
+        # ★wordWrap 라벨은 height-for-width 라서, 레이아웃이 최소 높이를
+        #   1줄로 잡고 나머지 줄을 잘라버린다(실측: 필요 32px 인데 16px 만
+        #   받음). MinimumExpanding 이면 sizeHint 아래로 안 눌린다.
+        self.lbl_rescue.setSizePolicy(QSizePolicy.Preferred,
+                                      QSizePolicy.MinimumExpanding)
         self.lbl_rescue.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         l4.addWidget(self.lbl_rescue)
         l4.addStretch()
-        bottom.addWidget(c4)
+        bottom.addWidget(c4, 1)   # ★ 요구조자 줄이 좁아서 감기던 문제 -
+                                  #   시스템상태 카드와 폭을 균등하게 나눈다
 
         col.addLayout(bottom, 2)
         return col
+
+    def _on_start_clicked(self):
+        """대기 상태에서 '시작'을 누르면 그때 시뮬레이션(소스)을 만들고
+        타이머를 돌리기 시작한다. 그 전까지는 화면이 '대기' 상태로만
+        표시된다."""
+        if self.started or not self.start_callback:
+            return
+        self.source = self.start_callback()
+        self.started = True
+        if not (self.source and getattr(self.source, "live_cam", False)):
+            self.cam.none_text = "시뮬레이션 모드 - 카메라 비활성"
+        self.map_view.none_text = "지도 없음"
+        self._t0 = time.time()      # 경과시간은 창을 연 시점이 아니라
+                                    # 임무를 시작한 시점부터 센다
+        self.btn_start.hide()
+        self.btn_pause.setEnabled(True)
+        self.timer.start(100)
+
+    def _toggle_pause(self):
+        if not (self.source and hasattr(self.source, "set_paused")):
+            return
+        paused = not getattr(self.source, "paused", False)
+        self.source.set_paused(paused)
+        self.btn_pause.setText("재개" if paused else "일시정지")
+
+    def _set_map_mode(self, canvas: bool):
+        """지도 영역에 벡터 캔버스를 쓸지, 비트맵 폴백(map_view)을 쓸지 전환.
+
+        ★따로 메서드로 뺀 이유: 서브클래스(dashboard_ex.ExDashboard)는
+        map_canvas 를 래퍼 위젯 안에 넣어 두므로, map_canvas 를 직접
+        숨기면 래퍼가 레이아웃 지분을 그대로 쥔 채 빈 칸으로 남는다
+        (대기 화면에서 지도 카드가 반으로 쪼개져 보이던 원인). 무엇을
+        보이고 숨길지는 레이아웃을 만든 쪽이 정하게 한다."""
+        self.map_canvas.setVisible(canvas)
+        self.map_view.setVisible(not canvas)
 
     def _toggle_cells(self):
         self.map_canvas.show_cells = not self.map_canvas.show_cells
@@ -813,6 +989,19 @@ class Dashboard(QWidget):
     def _toggle_legend(self):
         self.map_canvas.show_legend = not self.map_canvas.show_legend
         self.map_canvas.update()
+
+    def _update_metric_cards(self, s):
+        self.m_dist.update_value(
+            None if s.dist_mm is None else s.dist_mm / 1000, "{:.2f}",
+            f"신뢰도 {s.dist_conf*100:.0f}%",
+            [None if math.isnan(v) else v/1000 for v in s.hist_dist],
+            level_color=dist_conf_color(s.dist_conf))
+        t_sub, t_color = sensor_level(s.temp_c, TEMP_WARN_C, FIRE_TEMP_C)
+        self.m_temp.update_value(s.temp_c, "{:.1f}", t_sub, s.hist_temp,
+                                 level_color=t_color)
+        g_sub, g_color = sensor_level(s.gas_ppm, GAS_WARN_PPM, GAS_PPM)
+        self.m_gas.update_value(s.gas_ppm, "{:.0f}", g_sub, s.hist_gas,
+                                level_color=g_color)
 
     def _refresh(self):
         if self.source:
@@ -823,17 +1012,30 @@ class Dashboard(QWidget):
         self.lbl_online.setText("\u25cf SYSTEM ONLINE" if s.online
                                 else "\u25cf SYSTEM OFFLINE")
         self.lbl_online.setStyleSheet(f"color:{OK if s.online else DANGER};")
-        self.lbl_batt.setText(f"BATTERY {s.battery_pct}%")
+        # \u2605\ubc30\ud130\ub9ac\ub294 \uc2e4\uc81c \ud154\ub808\uba54\ud2b8\ub9ac\uac00 \uc544\ub2c8\ub77c \uacbd\uacfc\uc2dc\uac04\uc73c\ub85c \uae4e\uc774\ub294 \uc2dc\ubbac\uac12\uc774\ub2e4
+        #   (SimSource._tick_*). \uc2e4\ubb3c \ubc30\ud3ec \uc2dc ESP32 \uc804\uc555\uc744 \ubc1b\uae30 \uc804\uae4c\uc9c0\ub294
+        #   \uc9c4\uc9dc\ucc98\ub7fc \ubcf4\uc774\uba74 \uc704\ud5d8\ud558\ubbc0\ub85c (SIM) \uc744 \ubd99\uc5ec \uba85\uc2dc\ud55c\ub2e4.
+        self.lbl_batt.setText(f"BATTERY {s.battery_pct}% (SIM)")
+
+        el = int(time.time() - self._t0)
+        self.lbl_elapsed.setText(f"\uacbd\uacfc {el // 60:02d}:{el % 60:02d}")
+
+        # \ud0d0\uc0ac \uc9c4\ud589\ub960 - \uc804\uccb4 \uce78 \uc911 \ubbf8\ud0d0\uc0c9(-1) \uc774 \uc544\ub2cc \ube44\uc728
+        if s.map_grid is not None:
+            g = np.asarray(s.map_grid)
+            pct = int(round(100.0 * (g != -1).sum() / g.size))
+            self.prog_explore.setValue(pct)
+            self.lbl_explore.setText(f"\ud0d0\uc0ac {pct}%")
 
         if s.map_grid is not None:
-            self.map_canvas.show(); self.map_view.hide()
+            self._set_map_mode(canvas=True)
             self.map_canvas.set_data(s.map_grid, s.robot_cell, s.heading,
                                      s.trail, s.plan_path, s.hazards,
                                      rescue_targets=s.rescue_targets,
                                      rescue_paths_safe=s.rescue_paths_safe,
                                      rescue_paths_risky=s.rescue_paths_risky)
         else:
-            self.map_canvas.hide(); self.map_view.show()
+            self._set_map_mode(canvas=False)
             self.map_view.update_map(s.map_image)
         self.cam.update_frame(s.frame, s.detections)
 
@@ -847,18 +1049,7 @@ class Dashboard(QWidget):
             self.det_line.setText("탐지 없음")
             self.det_line.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
 
-        self.m_dist.update_value(
-            None if s.dist_mm is None else s.dist_mm / 1000, "{:.2f}",
-            f"신뢰도 {s.dist_conf*100:.0f}%",
-            [None if math.isnan(v) else v/1000 for v in s.hist_dist])
-        t_sub, t_color = sensor_level(s.temp_c, TEMP_WARN_C, FIRE_TEMP_C)
-        self.m_temp.update_value(s.temp_c, "{:.1f}", t_sub, s.hist_temp,
-                                 level_color=t_color)
-        g_sub, g_color = sensor_level(s.gas_ppm, GAS_WARN_PPM, GAS_PPM)
-        self.m_gas.update_value(s.gas_ppm, "{:.0f}", g_sub, s.hist_gas,
-                                level_color=g_color)
-        self.m_humid.update_value(s.humid_pct, "{:.0f}", "")
-
+        self._update_metric_cards(s)
         self.heat_t.update_grid(s.temp_grid, s.block_grid)
         self.heat_g.update_grid(s.gas_grid, s.block_grid)
 
@@ -870,27 +1061,35 @@ class Dashboard(QWidget):
         self.lbl_pos.setText(f"현재 위치 : ({s.pos[0]:.1f}, {s.pos[1]:.1f})")
         self.lbl_remain.setText(f"남은 거리 : {s.remain_m:.2f} m")
         self.lbl_eta.setText(f"예상 시간 : {int(s.eta_s)//60}분 {int(s.eta_s)%60}초")
-        self.lbl_pstat.setText("경로 상태 : " + ("안전" if s.path_ok else "재계획 필요"))
+        # ★충돌 횟수 - 예전엔 path_ok(bool) 로만 축약돼서 몇 번 부딪혔는지
+        #   알 수 없었다. 시뮬은 이미 세고 있던 값이다.
+        self.lbl_pstat.setText(
+            "경로 상태 : " + ("안전" if s.path_ok else "재계획 필요")
+            + f"   (충돌 {s.collisions}회)")
         self.lbl_pstat.setStyleSheet(
             f"color:{OK if s.path_ok else WARN}; font-size:12px;")
         self.lbl_phase.setText(f"단계 : {s.phase}  (스텝 {s.step})")
         self.lbl_phase.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
 
         if not s.rescue_targets:
+            self.lbl_alert.hide()
             self.lbl_rescue.setText("요구조자 : 미발견")
             self.lbl_rescue.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
         else:
+            self.lbl_alert.setText(f"⚠ 요구조자 {len(s.rescue_targets)}명 발견")
+            self.lbl_alert.show()
+            # ★1명당 3줄이면 2명만 발견돼도 카드 높이를 넘겨 잘렸다
+            #   (실측 확인). 한 줄로 압축해 인원이 늘어도 버티게 한다.
             lines = []
             any_safe = False
             any_risky_only = False
             for i, (tx, ty) in enumerate(s.rescue_targets):
                 safe = s.rescue_paths_safe[i] if i < len(s.rescue_paths_safe) else []
                 risky = s.rescue_paths_risky[i] if i < len(s.rescue_paths_risky) else []
-                lines.append(f"요구조자{i+1} 발견 : ({tx}, {ty})")
-                lines.append(f"  안전 경로 : {len(safe)}칸"
-                            if safe else "  안전 경로 : 없음")
-                lines.append(f"  위험감수 경로(가스 경유) : {len(risky)}칸"
-                            if risky else "  위험감수 경로 : 없음")
+                s_txt = f"{len(safe)}칸" if safe else "없음"
+                r_txt = f"{len(risky)}칸" if risky else "없음"
+                lines.append(
+                    f"구조자{i+1} ({tx},{ty})  안전 {s_txt} / 가스 {r_txt}")
                 if safe:
                     any_safe = True
                 elif risky:
@@ -903,15 +1102,16 @@ class Dashboard(QWidget):
 def main():
     app = QApplication(sys.argv)
     state = RobotState()
-    
-    if "--live" in sys.argv:
-        print("시뮬레이션 맵 + 라이브 카메라 모드로 실행합니다.")
-        src = SimSource(state, live_cam=True)
-    else:
+    live_cam = "--live" in sys.argv
+
+    def start_callback():
+        if live_cam:
+            print("시뮬레이션 맵 + 라이브 카메라 모드로 실행합니다.")
+            return SimSource(state, seed=SIM_SEED, live_cam=True)
         print("순수 시뮬레이션 모드로 실행합니다.")
-        src = SimSource(state, live_cam=False)
-        
-    win = Dashboard(state, src)
+        return SimSource(state, seed=SIM_SEED, live_cam=False)
+
+    win = Dashboard(state, start_callback=start_callback)
     win.show()
     sys.exit(app.exec())
 

@@ -1,1 +1,5 @@
 __pycache__/
+*.pt
+detection_log_*.csv
+width_log_*.csv
+.ua/
