@@ -38,6 +38,41 @@ except ImportError:
 FIRE_TEMP_C = getattr(_RC, "FIRE_TEMP_C", 50.0)
 GAS_PPM = getattr(_RC, "GAS_PPM", 40.0)
 
+# ── 위험 확산 (§③) ──────────────────────────────────────────────────
+# ★예전 ScalarField 는 완전히 정적이었다 - 발생원이 안 움직이고 안 커진다.
+#   그래서 "같은 칸을 다시 재는 것"에 아무 의미가 없었고, 서두를 이유도,
+#   안전/위험 두 경로 중 뭘 고를지 고민할 이유도 없었다. 시간이 지나면
+#   퍼지게 하면 측정 신선도(§②)와 조기 복귀 판단이 비로소 의미를 갖는다.
+#
+#   [무엇이 커지나] 발생원의 '중심 온도/농도'가 아니라 '퍼지는 범위'
+#   (가우시안 sigma)가 커진다. 불의 중심이 무한정 뜨거워지는 게 아니라
+#   뜨거운 영역이 넓어지는 쪽이 물리적으로 맞다.
+#
+#   [시계(時計)는 스텝] 벽시계가 아니라 시뮬 스텝을 쓴다 - 같은 시드면
+#   항상 같은 결과가 나와야 재현·회귀 대조가 가능하다.
+#
+#   ★★기본값 0.0(끔) - 켜기 전에 반드시 읽을 것.
+#     구현·검증은 끝났지만 기본으로 켜지 않았다. 켜면 rescue_planner 가
+#     "구조 경로 없음"을 쏟아내기 때문이다. 4개 시드 실측(안전/위험 경로가
+#     나온 요구조자 수):
+#         rate 0.00 -> 안전 5/8, 위험 6/8   (지금 동작)
+#         rate 0.10 -> 안전 3/8, 위험 4/8
+#         rate 0.60 -> 안전 1/8, 위험 3/8
+#     원인은 확산 속도가 아니라 경로 설계에 있다: rescue_planner 의 두
+#     경로가 '가스만' 감수하고 열은 안전/위험 양쪽 다 똑같이 벽으로 막는다
+#     (block_temp=True 고정). 그래서 불이 조금만 번져도 임계값을 넘긴 칸
+#     하나가 통로를 통째로 닫아버리고, 경로가 '길어지는' 게 아니라 '사라
+#     진다'. seed 31 은 겨우 +3.8°C 상승에서 두 경로가 동시에 사라졌다.
+#     (참고: seed 7 은 확산과 무관하게 원래부터 0/2 다 - 별개 문제.)
+#
+#     켜려면 먼저 열을 감수하는 경로를 만들어야 한다. 둘 중 하나:
+#       (a) 세 번째 경로 추가 - 열까지 감수(짧은 고온 구간 통과 허용)
+#       (b) 열을 하드 벽이 아니라 '비싼 칸'으로 - 온도에 비례한 통행비용을
+#           주고 A* 가 알아서 우회/통과를 고르게 한다 (더 현실적)
+HAZARD_GROWTH_RATE = 0.0        # TAU 스텝 동안 확산 반경이 이 비율만큼 증가
+HAZARD_GROWTH_TAU_STEPS = 400.0  # 기준 시간(스텝). 전형적 미션 길이에 맞춤
+HAZARD_GROWTH_MAX = 2.0         # 반경 배율 상한 (무한정 커지지 않게)
+
 def _union_find_groups(n, pair_candidates, close):
     """0..n-1 인덱스를 close(i,j) 가 True인 쌍끼리 전이적으로 묶는다.
     pair_candidates(i) 는 i와 실제로 비교해봐야 할 후보 인덱스만 골라
@@ -208,15 +243,24 @@ class ScalarField:
                          rng.uniform(size * .2, size * .8),
                          rng.uniform(.6, 1.0)) for _ in range(n_src)]
 
-    def value_at(self, x, y):
+    def sigma_at(self, step=0):
+        """step 시점의 확산 반경. 위 HAZARD_GROWTH_* 주석 참고.
+        HAZARD_GROWTH_RATE 가 0 이면 항상 초기값(예전의 정적 동작)."""
+        if HAZARD_GROWTH_RATE <= 0.0 or step <= 0:
+            return self.sigma
+        mult = 1.0 + HAZARD_GROWTH_RATE * (step / HAZARD_GROWTH_TAU_STEPS)
+        return self.sigma * min(mult, HAZARD_GROWTH_MAX)
+
+    def value_at(self, x, y, step=0):
         v = self.base
+        sig = self.sigma_at(step)
         for sx, sy, w in self.sources:
             d2 = (x - sx) ** 2 + (y - sy) ** 2
-            v += (self.peak - self.base) * w * math.exp(-d2 / (2 * self.sigma ** 2))
+            v += (self.peak - self.base) * w * math.exp(-d2 / (2 * sig ** 2))
         return v
 
-    def sample(self, x, y, noise=0.6, rng=None):
-        v = self.value_at(x, y)
+    def sample(self, x, y, noise=0.6, rng=None, step=0):
+        v = self.value_at(x, y, step)
         if rng is not None:
             v += rng.gauss(0, noise)
         return v
@@ -240,6 +284,32 @@ class ScalarField:
         for (r, c), vs in acc.items():
             out[r][c] = sum(vs) / len(vs)
         return out
+
+
+def meas_time_to_display(meas_time, size, n_out):
+    """측정 '시각'을 히트맵 격자(n_out x n_out)로 축약. (§②)
+
+    meas_time: {(gx, gy): time.monotonic() 값}. 측정 안 된 칸은 NaN.
+
+    ScalarField.to_display_grid() 와 동일한 좌표 규칙(행 뒤집기)을 쓴다 -
+    같은 위젯에 겹쳐 쓰이므로 규칙이 어긋나면 값과 나이가 서로 다른 칸을
+    가리키게 된다.
+
+    ★한 히트맵 칸에 원본 칸이 여러 개 뭉칠 때는 '가장 오래된' 측정 시각을
+      쓴다(최소값). 표시되는 값 자체가 그 칸들의 평균이라, 그 평균 안에
+      낡은 값이 하나라도 섞여 있으면 평균 전체를 그만큼 덜 믿어야 한다 -
+      위험 표시는 낙관보다 보수 쪽이 맞다. 바꾸고 싶으면 min -> max 한
+      글자다."""
+    out = np.full((n_out, n_out), np.nan)
+    k = size / n_out
+    for (gx, gy), t in meas_time.items():
+        cx, cy = int(gx / k), int(gy / k)
+        if 0 <= cx < n_out and 0 <= cy < n_out:
+            r = n_out - 1 - cy               # ★ to_display_grid 와 동일한 뒤집기
+            prev = out[r][cx]
+            if np.isnan(prev) or t < prev:
+                out[r][cx] = t
+    return out
 
 
 def grid_status_to_display(grid, n_out):
@@ -334,6 +404,11 @@ class DashViz:
         self.trail = []
         self.measured_t = {}
         self.measured_g = {}
+        # ★측정 '시각'(§②). 온도와 가스는 항상 같은 순간에 같은 칸에서
+        #   재므로 딕셔너리 하나로 충분하다. measured_t/g 의 값 모양은
+        #   그대로 두고 옆에 따로 둔다 - rescue_planner 등 소비자 5곳이
+        #   {(x,y): float} 를 그대로 기대하고 있어서다.
+        self.meas_time = {}
         self.rng = random.Random(seed + 991)
         self._last_update = 0.0
         # 요구조자는 이제 path_planner_sim2.rescuee_truths 가 정한다(정답).
@@ -359,10 +434,17 @@ class DashViz:
         #   여기서 최소 간격만큼 쉬어주면 GIL 이 자연히 Qt 스레드로 넘어간다.
         if self.pause_event is not None:
             self.pause_event.wait()   # 일시정지 중이면 여기서 시뮬 스레드가 대기
-        now = time.perf_counter()
-        if now - self._last_update < self.min_interval_s:
-            time.sleep(max(0.0, self.min_interval_s - (now - self._last_update)))
-            return
+        # ★[버그수정] 예전엔 "간격이 안 찼으면 남은 만큼 자고 *갱신 없이*
+        #   리턴"했다. 그러면 자고 일어난 직후 화면을 갱신하지 않고 다음
+        #   스텝(수십 ms)을 통째로 더 돈 뒤에야 갱신이 되므로, 갱신 간격이
+        #   min_interval_s 가 아니라 "min_interval_s + 스텝 1회"가 된다
+        #   (실측: 의도 80ms -> 실제 140ms, 7Hz). 잔 만큼의 시간도 아무
+        #   일도 안 하고 버린다. 자고 나서 그대로 갱신하면 의도한 주기가
+        #   그대로 지켜지고(12.5Hz), 자는 동안 GIL 이 Qt 스레드로 넘어가
+        #   화면이 끊기는 것도 같이 줄어든다.
+        wait = self.min_interval_s - (time.perf_counter() - self._last_update)
+        if wait > 0:
+            time.sleep(wait)
         self._last_update = time.perf_counter()
 
         # [방어] progress() 는 S.run() 메인 루프 안에서 매 스텝 호출된다.
@@ -385,10 +467,14 @@ class DashViz:
         rx, ry = S.robot_x, S.robot_y
         self.trail.append((rx, ry))
 
-        # 지나간 칸에서만 측정
+        # 지나간 칸에서만 측정. ★위험이 시간에 따라 퍼지므로(§③) 샘플에
+        #   현재 스텝을 넘긴다 - 같은 칸이라도 나중에 다시 재면 값이 다르다.
         gx, gy = int(rx), int(ry)
-        self.measured_t[(gx, gy)] = self.f_temp.sample(rx, ry, 0.7, self.rng)
-        self.measured_g[(gx, gy)] = self.f_gas.sample(rx, ry, 1.5, self.rng)
+        self.measured_t[(gx, gy)] = self.f_temp.sample(rx, ry, 0.7, self.rng,
+                                                       step=S.step)
+        self.measured_g[(gx, gy)] = self.f_gas.sample(rx, ry, 1.5, self.rng,
+                                                      step=S.step)
+        self.meas_time[(gx, gy)] = time.monotonic()
 
         # ★ MapCanvas(벡터 렌더러)에 원본 격자를 직접 넘긴다.
         #   path_planner_sim2 의 grid 값 체계(-1/0/1/2/3/4)가 MapCanvas 가
@@ -398,6 +484,7 @@ class DashViz:
         #   생략해 매 스텝 불필요한 래스터 렌더링 비용도 없앤다.
         st.map_grid = S.grid.copy()
         st.robot_cell = (rx, ry)
+        st.home_cell = S.home      # 구조 경로가 시작하는 칸 (거리 계산용)
         st.heading = S.robot_angle
         st.trail = self.trail
         # 실제 경로 전체는 S.run() 내부 지역변수라 밖에서 못 읽는다.
@@ -408,6 +495,9 @@ class DashViz:
         st.gas_ppm = self.measured_g[(gx, gy)]
         st.temp_grid = self.f_temp.to_display_grid(self.measured_t, self.grid_n)
         st.gas_grid = self.f_gas.to_display_grid(self.measured_g, self.grid_n)
+        # 측정 시각 격자 - 히트맵이 "얼마나 오래된 정보인가"를 흐리기로 표현
+        st.meas_time_grid = meas_time_to_display(self.meas_time, S.GRID_SIZE,
+                                                 self.grid_n)
         # 히트맵에 '장애물이라 못 잰다'/'가려서 확인 포기'를 구분 표시하기
         # 위한 상태 격자. 온도/가스 둘 다 같은 grid 에서 나오므로 공용.
         st.block_grid = grid_status_to_display(S.grid, self.grid_n)

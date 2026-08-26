@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import cv2
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF
 from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QFont, QPen
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QFrame,
                                QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -41,6 +41,26 @@ FIRE_TEMP_C  = getattr(C, "FIRE_TEMP_C", 50.0)
 GAS_PPM      = getattr(C, "GAS_PPM", 40.0)
 TEMP_WARN_C  = getattr(C, "TEMP_WARN_C", 40.0)
 GAS_WARN_PPM = getattr(C, "GAS_WARN_PPM", 30.0)
+CELL_SIZE_M  = getattr(C, "CELL_SIZE", 0.05)
+
+
+def path_length_m(cells, start=None):
+    """구조 경로의 실제 이동 거리(m).
+
+    ★[버그수정] 예전엔 화면에 len(path) 를 그대로 "N칸"으로 찍었다. 그런데
+    경로는 16방향(직진 1칸, 대각 1.41칸, 나이트 이동 (2,1)=2.24칸)이라
+    len(path) 는 '칸 수'가 아니라 '이동 횟수'다 - 실측 3개 시드에서 실제
+    거리보다 16~46% 짧게 표시되고 있었다(예: 52 를 2.60m 로 읽게 되는데
+    실제로는 3.90m). 구조자가 이 숫자로 거리를 가늠하므로 그대로 두면
+    안 된다. 선분 길이를 실제로 합산한다.
+
+    start(출발 칸)는 경로에 안 들어있다 - path_planner._reconstruct 가
+    출발 칸을 빼고 돌려주므로, 넘겨받으면 첫 구간까지 포함해서 센다."""
+    if not cells:
+        return 0.0
+    pts = ([start] + list(cells)) if start is not None else list(cells)
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in zip(pts, pts[1:])) * CELL_SIZE_M
 
 BG        = "#0d1117"      
 PANEL     = "#161b22"      
@@ -141,6 +161,7 @@ class RobotState:
     plan_path: list = field(default_factory=list)
     hazards:   list = field(default_factory=list)
     robot_cell: tuple | None = None
+    home_cell:  tuple | None = None   # 구조 경로의 출발 칸(진입 지점)
 
     rescue_targets:      list = field(default_factory=list)   # [(x,y), ...] 발견된 요구조자들
     rescue_paths_safe:   list = field(default_factory=list)   # rescue_targets 와 같은 순서/길이
@@ -149,6 +170,11 @@ class RobotState:
     temp_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
     gas_grid: np.ndarray = field(default_factory=lambda: np.full((GRID_N, GRID_N), np.nan))
     block_grid: np.ndarray = field(default_factory=lambda: np.zeros((GRID_N, GRID_N), dtype=np.int8))
+    # 히트맵 칸별 '측정 시각'(time.monotonic 기준, 미측정은 NaN). 값이
+    # 얼마나 오래된 정보인지 화면에서 구분하기 위한 것 - sim_bridge 의
+    # meas_time_to_display() 가 채운다. None 이면 흐리기 없이 그린다
+    # (MiniExplorer 폴백 경로처럼 시각 정보가 없는 소스용).
+    meas_time_grid: np.ndarray | None = None
     detections: list = field(default_factory=list)
 
     pos:        tuple = (0.0, 0.0)
@@ -209,8 +235,13 @@ class FrameGrabber:
             return None if self.frame is None else self.frame.copy()
 
     def stop(self):
+        # ★예전엔 0.1초 자고 바로 release() 했다. 스트림이 끊겨 read() 가
+        #   그보다 오래 붙들려 있으면, 읽는 도중에 VideoCapture 를 놓아
+        #   OpenCV 가 죽는다(종료할 때만 나서 재현이 어려운 크래시). 실제로
+        #   루프가 빠져나온 걸 확인하고 놓는다.
         self.running = False
-        time.sleep(0.1)
+        if self.t.is_alive():
+            self.t.join(timeout=2.0)
         if self.cap.isOpened():
             self.cap.release()
 
@@ -346,6 +377,11 @@ class SimSource:
 
     def _tick_sim2(self, dt):
         s = self.s
+        # ★탐사가 끝난 뒤에는 시간을 더 안 센다. 예전엔 완료 후에도 계속
+        #   배터리가 깎여서, 화면을 켜 둔 채 두면 다 끝난 미션의 배터리가
+        #   5%까지 내려가 "로봇에 문제가 생긴 것"처럼 보였다.
+        if s.phase == "done":
+            return
         self.t += dt
         if not self.live_cam:
             s.frame = None
@@ -485,22 +521,34 @@ class MetricCard(QFrame):
         self.spark.setMouseEnabled(False, False)
         self.spark.setMenuEnabled(False)
         self.curve = self.spark.plot(pen=pg.mkPen(color, width=2))
+        self._colors = None           # _apply_colors 가 바뀔 때만 갱신하도록
         lay.addWidget(self.spark)
+
+    def _apply_colors(self, val_c, sub_c, curve_c):
+        """색이 실제로 바뀔 때만 스타일시트/펜을 갱신한다.
+
+        ★값(숫자)은 매 프레임 바뀌지만 색은 위험단계가 넘어갈 때만 바뀐다.
+          그런데 예전엔 프레임마다 setStyleSheet 2회 + mkPen 새 객체 생성이
+          카드 3개분 돌았다 - 스타일시트는 걸 때마다 파싱+스타일 재계산이
+          일어나고, 펜 교체는 스파크라인 곡선을 통째로 다시 그리게 한다."""
+        if (val_c, sub_c, curve_c) == self._colors:
+            return
+        self._colors = (val_c, sub_c, curve_c)
+        self.val.setStyleSheet(f"color:{val_c};")
+        self.sub.setStyleSheet(f"color:{sub_c}; font-size:11px;")
+        self.curve.setPen(pg.mkPen(curve_c, width=2))
 
     def update_value(self, v, fmt="{:.1f}", sub="", hist=None, level_color=None):
         if v is None:
             self.val.setText("--")
-            self.val.setStyleSheet(f"color:{TEXT_DIM};")
             self.sub.setText(sub or self.none_text)
-            self.sub.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
+            self._apply_colors(TEXT_DIM, TEXT_DIM, self.color)
             return
         self.val.setText(fmt.format(v))
         c = level_color or self.color
-        self.val.setStyleSheet(f"color:{c};")
         self.sub.setText(sub)
-        self.sub.setStyleSheet(
-            f"color:{c if level_color else TEXT_DIM}; font-size:11px;")
-        self.curve.setPen(pg.mkPen(level_color or self.color, width=2))
+        self._apply_colors(c, c if level_color else TEXT_DIM,
+                           level_color or self.color)
         if hist:
             arr = np.asarray(hist, float)
             self.curve.setData(np.arange(len(arr)), arr)
@@ -511,8 +559,46 @@ class HeatGrid(QWidget):
              (0.50, (60, 170, 90)),
              (0.75, (215, 175, 55)),
              (1.00, (225, 70, 55))]
-    C_BLOCK_OBST = QColor("#11151d")
-    C_BLOCK_PINK = QColor("#a1547a")
+    C_BLOCK_OBST = (17, 21, 29)      # "#11151d" 장애물이라 못 잼
+    C_BLOCK_PINK = (161, 84, 122)    # "#a1547a" 가려서 확인 포기
+    C_NODATA     = (38, 44, 54)      # 아직 안 가봄
+
+    # ── 측정 신선도 표시 (§②) ────────────────────────────────────
+    # ★온도·가스는 로봇이 그 칸을 지날 때 한 번 재고 끝이다(접촉식). 실측
+    #   결과 미션 종료 시점에 측정 경과가 중앙값 280~447스텝, 최대 656스텝
+    #   이었는데, 화면은 4분 전 40°C 와 2초 전 40°C 를 완전히 똑같이
+    #   보여주고 있었다. 불이 번지는 상황(§③)에서는 이 차이가 곧 안전
+    #   여부라, 오래된 칸일수록 무채색 쪽으로 흐리게 만들어 "이 정보는
+    #   낡았다"를 색으로 드러낸다. 값 자체는 그대로 두고 채도만 낮춘다 -
+    #   숫자를 바꾸면 측정값을 왜곡하는 셈이라 안 된다.
+    FRESH_S = 5.0        # 이 이내면 100% 선명
+    STALE_S = 45.0       # 이 이상이면 DIM_FLOOR 까지 흐려짐
+    DIM_FLOOR = 0.35     # 아무리 오래돼도 이만큼은 남긴다(안 보이면 무의미)
+    DIM_LEVELS = 12      # 흐리기 단계 - 매 프레임 미세하게 바뀌어 화면을
+                         # 계속 다시 그리는 걸 막으려고 양자화한다
+    # ★단계만 양자화해서는 부족하다. 칸이 400개라 그중 하나쯤은 거의 매
+    #   프레임 단계 경계를 넘어서, 시뮬이 멈춰 있어도(일시정지·탐사완료)
+    #   히트맵이 계속 다시 그려졌다(실측: 값 고정 3초 동안 1회 -> 65회).
+    #   시각 자체를 이 간격으로 끊어서 보면 흐리기 결과가 초당 한 번만
+    #   바뀐다 - 40초에 걸친 페이드에 1초 granularity 는 눈에 안 보인다.
+    DIM_TICK_S = 1.0
+
+    # ★색상 룩업테이블(256단계). 예전엔 셀마다 _color() 를 파이썬으로 돌려
+    #   STOPS 구간을 선형보간했다 - 격자 400칸 x 히트맵 2개 x 10Hz =
+    #   초당 8000번. 값->색은 순수 함수라 한 번만 만들어두면 된다.
+    _LUT = None
+
+    @classmethod
+    def _lut(cls):
+        if cls._LUT is None:
+            xs = np.linspace(0.0, 1.0, 256)
+            ps = np.array([p for p, _ in cls.STOPS], float)
+            cs = np.array([c for _, c in cls.STOPS], float)
+            lut = np.empty((256, 3), float)
+            for ch in range(3):
+                lut[:, ch] = np.interp(xs, ps, cs[:, ch])
+            cls._LUT = lut.astype(np.uint8)
+        return cls._LUT
 
     def __init__(self, vmin, vmax, fmt="{:.0f}"):
         super().__init__()
@@ -521,22 +607,46 @@ class HeatGrid(QWidget):
         self.block = np.zeros((GRID_N, GRID_N), dtype=np.int8)
         self.setMinimumHeight(150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._rgb = None        # drawImage 용 버퍼(QImage 가 참조하므로 보관 필수)
+        self._bar = None
+        self.meas_time = None   # 칸별 측정 시각 (없으면 흐리기 안 함)
+        self._dim_q = None      # 양자화된 흐리기 단계 (다시 그릴지 판단용)
 
-    def update_grid(self, g, block=None):
-        self.grid = g
+    def _dim_quantized(self):
+        """칸별 흐리기 계수를 DIM_LEVELS 단계로 양자화해 돌려준다.
+        측정 시각이 없으면 None(= 흐리기 없음)."""
+        if self.meas_time is None:
+            return None
+        now = math.floor(time.monotonic() / self.DIM_TICK_S) * self.DIM_TICK_S
+        age = now - self.meas_time
+        span = max(self.STALE_S - self.FRESH_S, 1e-6)
+        t = np.clip((age - self.FRESH_S) / span, 0.0, 1.0)
+        dim = 1.0 - (1.0 - self.DIM_FLOOR) * t
+        dim[np.isnan(self.meas_time)] = 1.0      # 측정 없는 칸은 어차피 회색
+        return np.round(dim * self.DIM_LEVELS).astype(np.int16)
+
+    def update_grid(self, g, block=None, meas_time=None):
+        # ★값이 그대로면 다시 그리지 않는다. 대시보드는 시뮬 진행 여부와
+        #   무관하게 100ms 마다 이 함수를 부르는데(일시정지·탐사완료 후에도
+        #   계속), 예전엔 그때마다 무조건 update() 를 걸어 똑같은 그림을
+        #   다시 그렸다.
+        same = (self.grid is g or np.array_equal(self.grid, g, equal_nan=True))
         if block is not None:
+            if not np.array_equal(self.block, block):
+                same = False
             self.block = block
-        self.update()
-
-    def _color(self, t):
-        t = min(max(t, 0.0), 1.0)
-        for i in range(len(self.STOPS) - 1):
-            p0, c0 = self.STOPS[i]
-            p1, c1 = self.STOPS[i + 1]
-            if p0 <= t <= p1:
-                k = (t - p0) / (p1 - p0) if p1 > p0 else 0
-                return QColor(*[int(a + (b - a) * k) for a, b in zip(c0, c1)])
-        return QColor(*self.STOPS[-1][1])
+        self.grid = g
+        # ★흐리기(§②)는 시간이 흐르기만 해도 바뀐다 - 시뮬이 멈춰 있어도
+        #   낡아가는 게 맞다. 다만 매 프레임 미세하게 달라지는 값으로
+        #   비교하면 영영 다시 그리게 되므로 단계로 양자화해서 본다.
+        self.meas_time = meas_time
+        dim_q = self._dim_quantized()
+        if not (dim_q is None and self._dim_q is None) and \
+                not np.array_equal(dim_q, self._dim_q):
+            same = False
+        self._dim_q = dim_q
+        if not same:
+            self.update()
 
     def paintEvent(self, ev):
         g = self.grid
@@ -551,6 +661,9 @@ class HeatGrid(QWidget):
         # 정렬 여백으로 둔다. 컬러바(아래 by)는 원래대로 위젯 전체 폭을
         # 그대로 쓴다 - 격자 위치와 무관하게 항상 같은 자리에 있는 게
         # 범례처럼 더 읽기 쉽다.
+        if W <= 0 or H <= 0:
+            p.end()
+            return
         s = min(W / n, H / n)
         grid_px = s * n
         ox = (W - grid_px) / 2
@@ -570,35 +683,58 @@ class HeatGrid(QWidget):
         # 크기 공식 기준이라 지금 공식에서는 너무 쉽게 걸렸다).
         show_text = s >= 5
 
-        for r in range(n):
-            for c in range(n):
-                x, y = ox + c * cw, oy + r * ch
-                blk = self.block[r, c] if self.block is not None else 0
-                if blk == 1:
-                    p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1,
-                              self.C_BLOCK_OBST)
-                    continue
-                if blk == 2:
-                    p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1,
-                              self.C_BLOCK_PINK)
-                    continue
-                v = g[r, c]
-                if np.isnan(v):
-                    p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1,
-                               QColor(38, 44, 54))
-                    continue
-                t = (v - self.vmin) / (self.vmax - self.vmin)
-                col = self._color(t)
-                p.fillRect(int(x), int(y), int(cw) + 1, int(ch) + 1, col)
-                if show_text:
-                    lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
-                    p.setPen(QColor("#080c12") if lum > 150 else QColor("#e6edf3"))
-                    p.drawText(int(x), int(y), int(cw), int(ch),
-                               Qt.AlignCenter, self.fmt.format(v))
+        # ── 셀 색상: 격자 전체를 numpy 로 한 번에 만들어 이미지 한 장으로
+        #    그린다. 예전엔 셀마다 fillRect + 파이썬 색보간이었다(400칸 x
+        #    히트맵 2개 x 10Hz). 확대는 NEAREST 로 - 셀 경계가 뭉개지면
+        #    격자를 읽는 의미가 없다.
+        lut = self._lut()
+        blk = self.block if self.block is not None else np.zeros_like(g, np.int8)
+        with np.errstate(invalid="ignore"):
+            t = (np.nan_to_num(g, nan=0.0) - self.vmin) / (self.vmax - self.vmin)
+        idx = np.clip(t * 255.0, 0, 255).astype(np.uint8)
+        rgb = lut[idx].astype(np.float32)
+        nan_m = np.isnan(g)
+        # ★오래된 측정일수록 무채색(C_NODATA) 쪽으로 섞어 흐리게 한다.
+        #   어둡게 하는 대신 회색으로 빼는 이유: 어둡게 하면 컬러맵의
+        #   낮은 값(파랑 계열)과 헷갈린다 - "낡음"과 "차가움"은 다른 정보다.
+        if self._dim_q is not None:
+            # ★변수명 주의: f 는 위에서 QFont 로 쓰고 있다(가리면 아래
+            #   컬러바 라벨에서 폰트 대신 배열을 만지게 된다).
+            dim = (self._dim_q.astype(np.float32) / self.DIM_LEVELS)[..., None]
+            rgb = rgb * dim + np.float32(self.C_NODATA) * (1.0 - dim)
+        rgb = rgb.astype(np.uint8)
+        rgb[nan_m] = self.C_NODATA
+        rgb[blk == 2] = self.C_BLOCK_PINK
+        rgb[blk == 1] = self.C_BLOCK_OBST      # 장애물이 확인불가보다 우선
+        self._rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        img = QImage(self._rgb.data, n, n, 3 * n, QImage.Format_RGB888)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.drawImage(QRectF(ox, oy, grid_px, grid_px), img)
 
+        if show_text:
+            # 숫자는 값이 있고 가려지지 않은 칸에만. 배경 밝기에 따라
+            # 글자색을 뒤집는다(어두운 칸엔 밝은 글자).
+            lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1]
+                   + 0.114 * rgb[..., 2])
+            dark_pen, light_pen = QColor("#080c12"), QColor("#e6edf3")
+            cur = None
+            for r, c in zip(*np.where(~nan_m & (blk == 0))):
+                want = dark_pen if lum[r, c] > 150 else light_pen
+                if want is not cur:
+                    p.setPen(want); cur = want
+                p.drawText(int(ox + c * cw), int(oy + r * ch),
+                           int(cw), int(ch),
+                           Qt.AlignCenter, self.fmt.format(g[r, c]))
+
+        # ── 컬러바: 예전엔 픽셀 폭만큼 fillRect 를 돌렸다(가로 700px 이면
+        #    프레임당 700회). LUT 자체가 이미 그라디언트라 이미지 한 장으로
+        #    늘려 그리면 된다. 여기는 NEAREST 가 아니라 부드럽게.
         by = H + 3
-        for i in range(W):
-            p.fillRect(i, int(by), 1, 8, self._color(i / max(W - 1, 1)))
+        if self._bar is None:
+            self._bar = np.ascontiguousarray(lut.reshape(1, 256, 3))
+        bar_img = QImage(self._bar.data, 256, 1, 3 * 256, QImage.Format_RGB888)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(QRectF(0, by, W, 8), bar_img)
         p.setPen(QColor(TEXT_DIM))
         f.setPixelSize(11); p.setFont(f)
         p.drawText(1, int(by) + 7, self.fmt.format(self.vmin))
@@ -617,16 +753,26 @@ class CameraView(QLabel):
         self._pm = None
         self._dets = []
         self._current_rgb = None
+        self._last_frame = None       # 같은 프레임 재렌더 방지 (update_frame)
         self.none_text = "영상 없음"   # 실물 카메라 연결 실패용 기본 문구.
                                        # 시뮬레이션 모드에서는 Dashboard 가
                                        # "시뮬레이션 모드 - 카메라 비활성"로 바꿔준다.
 
     def update_frame(self, frame_bgr, detections):
-        self._dets = detections or []
+        detections = detections or []
         if frame_bgr is None:
+            self._dets = detections
             self.setText(self.none_text)
             return
-            
+        # ★같은 프레임을 다시 그리지 않는다. 카메라 스레드는 대략 30fps 로
+        #   프레임을 갈아끼우지만 대시보드는 10Hz 로 여기를 부르고, 연결이
+        #   끊기거나 느려지면 같은 배열이 계속 들어온다 - 그때마다 BGR->RGB
+        #   복사 + QImage + 박스 그리기 + 스케일링을 통째로 다시 했다.
+        if frame_bgr is self._last_frame and detections == self._dets:
+            return
+        self._last_frame = frame_bgr
+        self._dets = detections
+
         self._current_rgb = frame_bgr[..., ::-1].copy()
         h, w, _ = self._current_rgb.shape
         img = QImage(self._current_rgb.data, w, h, 3 * w, QImage.Format_RGB888)
@@ -684,12 +830,18 @@ class StatusRow(QWidget):
     def __init__(self, name):
         super().__init__()
         lay = QHBoxLayout(self); lay.setContentsMargins(0, 2, 0, 2)
-        self.dot = QLabel("\u25cf"); self.dot.setFixedWidth(14)
+        self.dot = QLabel("●"); self.dot.setFixedWidth(14)
         n = QLabel(name)
         self.st = QLabel("--"); self.st.setAlignment(Qt.AlignRight)
+        self._ok = None               # set_ok 가 바뀔 때만 스타일을 갱신하도록
         lay.addWidget(self.dot); lay.addWidget(n); lay.addStretch(); lay.addWidget(self.st)
 
     def set_ok(self, ok):
+        # ★상태는 거의 안 바뀌는데 예전엔 100ms 마다 무조건 스타일시트를
+        #   다시 걸었다(항목 7개 x 2회 = 초당 140회의 스타일 재계산).
+        if ok == self._ok:
+            return
+        self._ok = ok
         c = OK if ok else DANGER
         self.dot.setStyleSheet(f"color:{c};")
         self.st.setStyleSheet(f"color:{c}; font-size:11px;")
@@ -712,6 +864,8 @@ class Dashboard(QWidget):
         self._build()
 
         self._t0 = time.time()        # 미션 경과시간 기준점
+        self._done_elapsed = None     # 탐사 완료 시점의 경과시간(그 뒤로 고정)
+        self._css = {}                # 위젯별 마지막 스타일시트 (_set_text_color)
 
         from PySide6.QtGui import QShortcut, QKeySequence
         QShortcut(QKeySequence("G"), self, activated=self._toggle_cells)
@@ -741,7 +895,7 @@ class Dashboard(QWidget):
         lay = QHBoxLayout(f); lay.setContentsMargins(16, 0, 16, 0)
 
         t = QLabel("DISASTER EXPLORATION ROBOT"); t.setObjectName("topTitle")
-        self.lbl_online = QLabel("\u25cf SYSTEM OFFLINE")
+        self.lbl_online = QLabel("● SYSTEM OFFLINE")
         self.lbl_online.setStyleSheet(f"color:{DANGER};")
         # ★요구조자 발견 배너 - 미션에서 가장 중요한 이벤트인데 예전엔
         #   우측 하단 텍스트만 조용히 바뀌어 놓치기 쉬웠다.
@@ -813,6 +967,9 @@ class Dashboard(QWidget):
 
     def closeEvent(self, event):
         print("시스템 종료 커맨드 수신. 앱을 종료합니다.")
+        # ★타이머를 먼저 세운다 - 안 그러면 source.stop() 이후에도 _refresh
+        #   가 한 번 더 돌면서 이미 정리된 소스를 건드릴 수 있다.
+        self.timer.stop()
         if self.source and hasattr(self.source, 'stop'):
             self.source.stop()
         event.accept()
@@ -864,7 +1021,7 @@ class Dashboard(QWidget):
         c2, lay2 = card("센서 데이터")
         row = QHBoxLayout(); row.setSpacing(10)
         self.m_dist  = MetricCard("거리 (ToF)", "m",   ACCENT)
-        self.m_temp  = MetricCard("온도",       "\u00b0C", DANGER)
+        self.m_temp  = MetricCard("온도",       "°C", DANGER)
         self.m_gas   = MetricCard("가스",       "ppm", WARN)
         # ★습도 카드 제거 - 센서가 아예 없어 항상 "센서 미설치"만 띄우고
         #   자리만 차지했다. 센서를 달면 MetricCard 한 줄과 _refresh 의
@@ -893,13 +1050,15 @@ class Dashboard(QWidget):
                               #   노이즈 텍스처만 채우는 자리라 우선순위 낮춤
 
         grids = QHBoxLayout(); grids.setSpacing(10)
-        c1, l1 = card("온도 맵 (\u00b0C)")
+        # ★"흐릴수록 오래된 측정"을 제목에 적어둔다 - 안 적으면 흐린 칸을
+        #   낮은 값으로 오해한다(색이 옅어진 게 아니라 회색이 섞인 것).
+        c1, l1 = card("온도 맵 (°C)  ·  흐릴수록 오래된 측정")
         # ★컬러바 상한을 FIRE_TEMP_C/GAS_PPM 기준으로 계산한다(기존
         # 25~60/0~60 하드코딩과 지금 값은 같지만, 이제 임계값을 바꾸면
         # 같이 따라간다) - §8-3 단일 출처화와 같은 이유.
         self.heat_t = HeatGrid(25, FIRE_TEMP_C + 10)
         l1.addWidget(self.heat_t); grids.addWidget(c1)
-        c2, l2 = card("가스 농도 맵 (ppm)")
+        c2, l2 = card("가스 농도 맵 (ppm)  ·  흐릴수록 오래된 측정")
         self.heat_g = HeatGrid(0, GAS_PPM + 20)
         l2.addWidget(self.heat_g); grids.addWidget(c2)
         col.addLayout(grids, 5)   # ★ 히트맵 비중 확대 (3→5) - 세분화된
@@ -990,6 +1149,18 @@ class Dashboard(QWidget):
         self.map_canvas.show_legend = not self.map_canvas.show_legend
         self.map_canvas.update()
 
+    def _set_text_color(self, label, text, color, extra=""):
+        """라벨 글자와 색을 함께 갱신하되, 스타일시트는 실제로 바뀔 때만 건다.
+
+        ★setStyleSheet 는 문자열을 파싱해서 위젯 스타일을 다시 계산(polish)
+          하게 만든다 - 값이 같아도 비용이 그대로 든다. 이 대시보드는
+          100ms 마다 화면 전체를 갱신하는데 색이 바뀌는 일은 드물다."""
+        label.setText(text)
+        css = f"color:{color};{extra}"
+        if self._css.get(label) != css:
+            self._css[label] = css
+            label.setStyleSheet(css)
+
     def _update_metric_cards(self, s):
         self.m_dist.update_value(
             None if s.dist_mm is None else s.dist_mm / 1000, "{:.2f}",
@@ -1008,26 +1179,38 @@ class Dashboard(QWidget):
             self.source.tick()
         s = self.state
 
+        # ★탐사가 끝나면(phase=="done") 경과시간을 그 시점에 멈춘다 - 계속
+        #   올라가면 아직 수색 중인 것처럼 읽힌다(구조자 뷰와 동일한 규칙).
+        done = (s.phase == "done")
+        if done and self._done_elapsed is None:
+            self._done_elapsed = int(time.time() - self._t0)
+            # 끝난 시뮬레이션을 "일시정지"할 수는 없다 - 눌러도 아무 일이
+            # 안 일어나는 버튼은 고장난 것처럼 보이므로 비활성화한다.
+            self.btn_pause.setEnabled(False)
+
         self.lbl_clock.setText(time.strftime("%H:%M:%S"))
-        self.lbl_online.setText("\u25cf SYSTEM ONLINE" if s.online
-                                else "\u25cf SYSTEM OFFLINE")
-        self.lbl_online.setStyleSheet(f"color:{OK if s.online else DANGER};")
-        # \u2605\ubc30\ud130\ub9ac\ub294 \uc2e4\uc81c \ud154\ub808\uba54\ud2b8\ub9ac\uac00 \uc544\ub2c8\ub77c \uacbd\uacfc\uc2dc\uac04\uc73c\ub85c \uae4e\uc774\ub294 \uc2dc\ubbac\uac12\uc774\ub2e4
-        #   (SimSource._tick_*). \uc2e4\ubb3c \ubc30\ud3ec \uc2dc ESP32 \uc804\uc555\uc744 \ubc1b\uae30 \uc804\uae4c\uc9c0\ub294
-        #   \uc9c4\uc9dc\ucc98\ub7fc \ubcf4\uc774\uba74 \uc704\ud5d8\ud558\ubbc0\ub85c (SIM) \uc744 \ubd99\uc5ec \uba85\uc2dc\ud55c\ub2e4.
+        if done:
+            self._set_text_color(self.lbl_online, "● 탐사 완료", ACCENT)
+        elif s.online:
+            self._set_text_color(self.lbl_online, "● SYSTEM ONLINE", OK)
+        else:
+            self._set_text_color(self.lbl_online, "● SYSTEM OFFLINE", DANGER)
+        # ★배터리는 실제 텔레메트리가 아니라 경과시간으로 깎이는 시뮬값이다
+        #   (SimSource._tick_*). 실물 배포 시 ESP32 전압을 받기 전까지는
+        #   진짜처럼 보이면 위험하므로 (SIM) 을 붙여 명시한다.
         self.lbl_batt.setText(f"BATTERY {s.battery_pct}% (SIM)")
 
-        el = int(time.time() - self._t0)
-        self.lbl_elapsed.setText(f"\uacbd\uacfc {el // 60:02d}:{el % 60:02d}")
+        el = self._done_elapsed if self._done_elapsed is not None \
+            else int(time.time() - self._t0)
+        self.lbl_elapsed.setText(f"경과 {el // 60:02d}:{el % 60:02d}")
 
-        # \ud0d0\uc0ac \uc9c4\ud589\ub960 - \uc804\uccb4 \uce78 \uc911 \ubbf8\ud0d0\uc0c9(-1) \uc774 \uc544\ub2cc \ube44\uc728
         if s.map_grid is not None:
+            # 탐사 진행률 - 전체 칸 중 미탐색(-1) 이 아닌 비율
             g = np.asarray(s.map_grid)
             pct = int(round(100.0 * (g != -1).sum() / g.size))
             self.prog_explore.setValue(pct)
-            self.lbl_explore.setText(f"\ud0d0\uc0ac {pct}%")
+            self.lbl_explore.setText(f"탐사 {pct}%")
 
-        if s.map_grid is not None:
             self._set_map_mode(canvas=True)
             self.map_canvas.set_data(s.map_grid, s.robot_cell, s.heading,
                                      s.trail, s.plan_path, s.hazards,
@@ -1041,20 +1224,39 @@ class Dashboard(QWidget):
 
         if s.detections:
             d = s.detections[0]
-            self.det_line.setText(
+            self._set_text_color(
+                self.det_line,
                 f"{d['label']}  |  신뢰도 {d['conf']*100:.0f}%  |  "
-                f"거리 {d['dist_m']:.2f} m  |  각도 {d['angle']:+.1f}\u00b0")
-            self.det_line.setStyleSheet(f"color:{DANGER}; font-size:11px;")
+                f"거리 {d['dist_m']:.2f} m  |  각도 {d['angle']:+.1f}°",
+                DANGER, " font-size:11px;")
         else:
-            self.det_line.setText("탐지 없음")
-            self.det_line.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
+            self._set_text_color(self.det_line, "탐지 없음",
+                                 TEXT_DIM, " font-size:11px;")
 
         self._update_metric_cards(s)
-        self.heat_t.update_grid(s.temp_grid, s.block_grid)
-        self.heat_g.update_grid(s.gas_grid, s.block_grid)
+        self.heat_t.update_grid(s.temp_grid, s.block_grid, s.meas_time_grid)
+        self.heat_g.update_grid(s.gas_grid, s.block_grid, s.meas_time_grid)
 
         for name, ok in s.modules.items():
             self.rows[name].set_ok(ok)
+
+        # ★시작 전에는 값이 없는데도 "목표 (0.0, 0.0) / 남은 거리 0.00 m /
+        #   예상 0분 0초 / 경로 상태 안전"이 실제 측정값처럼 찍혀 있었다 -
+        #   대기 화면이 정상 운행 중인 것처럼 읽힌다. 데이터가 오기 전에는
+        #   "--" 로 비워 둔다.
+        if s.map_grid is None:
+            self.lbl_goal.setText("목표 위치 : --")
+            self.lbl_pos.setText("현재 위치 : --")
+            self.lbl_remain.setText("남은 거리 : --")
+            self.lbl_eta.setText("예상 시간 : --")
+            self._set_text_color(self.lbl_pstat, "경로 상태 : --",
+                                 TEXT_DIM, " font-size:12px;")
+            self._set_text_color(self.lbl_phase, "단계 : 대기",
+                                 TEXT_DIM, " font-size:11px;")
+            self.lbl_alert.hide()
+            self._set_text_color(self.lbl_rescue, "요구조자 : --",
+                                 TEXT_DIM, " font-size:12px;")
+            return
 
         g = s.goal or (0, 0)
         self.lbl_goal.setText(f"목표 위치 : ({g[0]:.1f}, {g[1]:.1f})")
@@ -1063,18 +1265,18 @@ class Dashboard(QWidget):
         self.lbl_eta.setText(f"예상 시간 : {int(s.eta_s)//60}분 {int(s.eta_s)%60}초")
         # ★충돌 횟수 - 예전엔 path_ok(bool) 로만 축약돼서 몇 번 부딪혔는지
         #   알 수 없었다. 시뮬은 이미 세고 있던 값이다.
-        self.lbl_pstat.setText(
+        self._set_text_color(
+            self.lbl_pstat,
             "경로 상태 : " + ("안전" if s.path_ok else "재계획 필요")
-            + f"   (충돌 {s.collisions}회)")
-        self.lbl_pstat.setStyleSheet(
-            f"color:{OK if s.path_ok else WARN}; font-size:12px;")
-        self.lbl_phase.setText(f"단계 : {s.phase}  (스텝 {s.step})")
-        self.lbl_phase.setStyleSheet(f"color:{TEXT_DIM}; font-size:11px;")
+            + f"   (충돌 {s.collisions}회)",
+            OK if s.path_ok else WARN, " font-size:12px;")
+        self._set_text_color(self.lbl_phase, f"단계 : {s.phase}  (스텝 {s.step})",
+                             TEXT_DIM, " font-size:11px;")
 
         if not s.rescue_targets:
             self.lbl_alert.hide()
-            self.lbl_rescue.setText("요구조자 : 미발견")
-            self.lbl_rescue.setStyleSheet(f"color:{TEXT_DIM}; font-size:12px;")
+            self._set_text_color(self.lbl_rescue, "요구조자 : 미발견",
+                                 TEXT_DIM, " font-size:12px;")
         else:
             self.lbl_alert.setText(f"⚠ 요구조자 {len(s.rescue_targets)}명 발견")
             self.lbl_alert.show()
@@ -1086,17 +1288,19 @@ class Dashboard(QWidget):
             for i, (tx, ty) in enumerate(s.rescue_targets):
                 safe = s.rescue_paths_safe[i] if i < len(s.rescue_paths_safe) else []
                 risky = s.rescue_paths_risky[i] if i < len(s.rescue_paths_risky) else []
-                s_txt = f"{len(safe)}칸" if safe else "없음"
-                r_txt = f"{len(risky)}칸" if risky else "없음"
+                s_txt = (f"{path_length_m(safe, s.home_cell):.2f}m"
+                         if safe else "없음")
+                r_txt = (f"{path_length_m(risky, s.home_cell):.2f}m"
+                         if risky else "없음")
                 lines.append(
                     f"구조자{i+1} ({tx},{ty})  안전 {s_txt} / 가스 {r_txt}")
                 if safe:
                     any_safe = True
                 elif risky:
                     any_risky_only = True
-            self.lbl_rescue.setText("\n".join(lines))
             color = OK if any_safe else (WARN if any_risky_only else DANGER)
-            self.lbl_rescue.setStyleSheet(f"color:{color}; font-size:12px;")
+            self._set_text_color(self.lbl_rescue, "\n".join(lines),
+                                 color, " font-size:12px;")
 
 
 def main():

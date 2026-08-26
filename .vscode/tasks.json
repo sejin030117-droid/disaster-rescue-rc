@@ -1,0 +1,50 @@
+{
+  // ESP32 .ino 를 VS Code 안에서 바로 컴파일/업로드한다.
+  // Arduino 확장은 2024-10 마켓플레이스에서 삭제됐으므로, Arduino IDE 에
+  // 번들된 arduino-cli 를 직접 부른다.
+  //
+  //   Ctrl+Shift+B        -> 컴파일 (기본 빌드 작업)
+  //   Ctrl+Shift+P > Tasks: Run Task -> 업로드 / 시리얼 모니터
+  //
+  // 에러는 problemMatcher($gcc) 가 잡아서 "문제" 패널에 줄번호까지 찍어준다.
+  "version": "2.0.0",
+  "options": {
+    "env": {
+      "ACLI": "C:\\Users\\jay07\\AppData\\Local\\Programs\\Arduino IDE\\resources\\app\\lib\\backend\\resources\\arduino-cli.exe",
+      "FQBN": "esp32:esp32:esp32",
+      "SKETCH": "rescue_sensor_node"
+    }
+  },
+  "tasks": [
+    {
+      "label": "Arduino: 컴파일",
+      "type": "shell",
+      "command": "& \"$env:ACLI\" compile --warnings all --fqbn $env:FQBN $env:SKETCH",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Arduino: 업로드",
+      "type": "shell",
+      // ★ COM 포트는 환경마다 다르다. "Arduino: 포트 확인" 으로 보고 여기를 고칠 것.
+      "command": "& \"$env:ACLI\" upload -p COM3 --fqbn $env:FQBN $env:SKETCH",
+      "problemMatcher": ["$gcc"],
+      "presentation": { "reveal": "always", "panel": "shared" }
+    },
+    {
+      "label": "Arduino: 포트 확인",
+      "type": "shell",
+      "command": "& \"$env:ACLI\" board list",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared" }
+    },
+    {
+      "label": "Arduino: 시리얼 모니터 (115200)",
+      "type": "shell",
+      "command": "& \"$env:ACLI\" monitor -p COM3 --config baudrate=115200",
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ]
+}

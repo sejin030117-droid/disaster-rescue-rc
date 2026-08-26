@@ -174,10 +174,16 @@ SAFE_BLOCK_ESTIMATED = True
 # 제거했다 - 값 2 가 이제 grid 에 아예 안 나온다 (§11 update_obstacle_shape).
 
 # -----------------------------------------------------------------------------
-# 1-7. 회전 비용
+# 1-7. 회전 비용 / 경로 스무딩
 # -----------------------------------------------------------------------------
 
 TURN_COST = 1.2
+
+# 한 스텝에 병합할 최대 직선거리(mm). A* 는 한 칸씩 이어진 경로를 내지만
+# 실제로는 직선으로 질러갈 수 있는 구간이 많다 - 병합하면 회전 횟수와 스텝
+# 수가 줄어든다(smooth_next 참고). 0 이면 스무딩을 끈다(= 기존 동작).
+# ★보수적으로 잡을 것: 시뮬은 포즈가 곧 진실이라 실물보다 좋아 보인다.
+SMOOTH_MAX_MM = 200.0
 
 # -----------------------------------------------------------------------------
 # 1-8. 가시선(LoS) 정책
@@ -1244,6 +1250,25 @@ def _build_turn_diff_table():
 TURN_DIFF_TABLE = _build_turn_diff_table()
 
 
+def _build_move_table_flat():
+    """MOVE_TABLE 을 '1차원 격자 인덱스 오프셋' 형태로 미리 풀어둔다. ★성능
+
+    bfs_from 의 안쪽 루프는 칸당 16방향을 도는데, 예전엔 좌표를 (x, y)
+    튜플로 다뤄서 반복마다 튜플 해싱(dict/set 조회)과 2차원 리스트
+    이중 인덱싱(smap[ny][nx] - 행 리스트를 꺼낸 뒤 다시 인덱싱)이 일어났다.
+    격자는 60x60 고정이므로 idx = y*GRID_SIZE + x 로 납작하게 펴면 이웃
+    이동이 그냥 정수 덧셈 한 번이 된다.
+
+    각 항목: ((dx, dy), 이동비용, 목적칸 오프셋, 경유칸 오프셋들)"""
+    return tuple(
+        ((dx, dy), cost, dy * GRID_SIZE + dx,
+         tuple(mdy * GRID_SIZE + mdx for mdx, mdy in mids))
+        for (dx, dy), cost, mids in MOVE_TABLE)
+
+
+MOVE_TABLE_FLAT = _build_move_table_flat()
+
+
 def planning_grid(g, strict=True):
     """경로계획용으로 값을 치환한 지도 사본. 확정 채움(1)을 막고 싶으면
     3으로 바꿔서 넘긴다. ★미확정(2)은 더 이상 grid 에 나오지 않으므로
@@ -1292,20 +1317,42 @@ def bfs_from(g, sx, sy, heading_deg=None):
             abs((math.degrees(math.atan2(dy, dx)) - heading_deg + 180) % 360 - 180) / 90.0
             for (dx, dy), _, _ in MOVE_TABLE)
 
+    # ★[성능] 탐색 자체는 1차원 배열(cost/par/dirs/done)로 돌린다 -
+    #   예전엔 reach 딕셔너리와 done 집합을 (x, y) 튜플로 직접 다뤄서
+    #   간선 완화(호출당 5만 회 남짓)마다 튜플 생성 + 해싱이 붙었다.
+    #   결과로 돌려주는 reach 딕셔너리는 마지막에 한 번만 만든다 -
+    #   내용/형식은 예전과 완전히 동일하다(실제 미션 3개 시드에서 뽑은
+    #   400개 입력으로 기존 구현과 전수 대조해 0건 불일치 확인).
+    size = GRID_SIZE * GRID_SIZE
+    push, pop = heapq.heappush, heapq.heappop
+
     for strict in (True, False):
         pg = planning_grid(g, strict)
         cmap = compute_clearance_map(pg)
         smap = compute_safe_map(pg)
-        # 진입방향 인덱스: -1 = 시작 칸(아직 이동 안 함, start_diffs 사용)
-        reach = {(sx, sy): (None, 0.0, -1)}
+        # 2차원 리스트를 납작하게 펴 둔다(안쪽 루프의 이중 인덱싱 제거)
+        sflat = [v for row in smap for v in row]
+        cflat = [v for row in cmap for v in row]
+
+        cost = [float("inf")] * size
+        par = [-1] * size            # 부모의 1차원 인덱스 (-1 = 부모 없음)
+        # 진입방향 인덱스: -2 = 미방문, -1 = 시작 칸(start_diffs 사용)
+        dirs = [-2] * size
+        done = bytearray(size)
+
+        si = sy * GRID_SIZE + sx
+        cost[si] = 0.0
+        dirs[si] = -1
         pq = [(0.0, sx, sy)]
-        done = set()
+        n_reached = 1                # 예전 len(reach) 와 같은 의미
+
         while pq:
-            d, cx, cy = heapq.heappop(pq)
-            if (cx, cy) in done:
+            d, cx, cy = pop(pq)
+            ci = cy * GRID_SIZE + cx
+            if done[ci]:
                 continue
-            done.add((cx, cy))
-            prev_i = reach[(cx, cy)][2]
+            done[ci] = 1
+            prev_i = dirs[ci]
             # 이 칸에서 나가는 16방향 각각의 회전 벌점을 한 번에 고른다
             if not use_turn:
                 diffs = None
@@ -1313,30 +1360,46 @@ def bfs_from(g, sx, sy, heading_deg=None):
                 diffs = TURN_DIFF_TABLE[prev_i]
             else:
                 diffs = start_diffs          # None 이면 시작 헤딩 미지정 = 벌점 없음
-            for i, ((dx, dy), stepc, mids) in enumerate(MOVE_TABLE):
-                nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE):
+            for i, ((dx, dy), stepc, doff, moffs) in enumerate(MOVE_TABLE_FLAT):
+                nx = cx + dx
+                if nx < 0 or nx >= GRID_SIZE:
                     continue
-                if not smap[ny][nx]:
+                ny = cy + dy
+                if ny < 0 or ny >= GRID_SIZE:
                     continue
-                blocked = False
-                for mdx, mdy in mids:
-                    if not smap[cy + mdy][cx + mdx]:
-                        blocked = True
+                ni = ci + doff
+                if not sflat[ni]:
+                    continue
+                for mo in moffs:             # 경유 칸이 하나라도 막히면 못 간다
+                    if not sflat[ci + mo]:
                         break
-                if blocked:
-                    continue
-                lack = CLEARANCE_WANT - cmap[ny][nx]
-                nd = d + stepc
-                if diffs is not None:
-                    nd += TURN_COST * diffs[i]
-                if lack > 0:
-                    nd += CLEARANCE_COST * lack
-                if (nx, ny) not in reach or nd < reach[(nx, ny)][1]:
-                    reach[(nx, ny)] = ((cx, cy), nd, i)
-                    heapq.heappush(pq, (nd, nx, ny))
-        if len(reach) > 1 or not (strict and SAFE_BLOCK_ESTIMATED):
-            return reach
+                else:
+                    nd = d + stepc
+                    if diffs is not None:
+                        nd += TURN_COST * diffs[i]
+                    lack = CLEARANCE_WANT - cflat[ni]
+                    if lack > 0:
+                        nd += CLEARANCE_COST * lack
+                    if nd < cost[ni]:
+                        if dirs[ni] == -2:
+                            n_reached += 1
+                        cost[ni] = nd
+                        par[ni] = ci
+                        dirs[ni] = i
+                        push(pq, (nd, nx, ny))
+
+        if n_reached > 1 or not (strict and SAFE_BLOCK_ESTIMATED):
+            break
+
+    reach = {}
+    for idx in range(size):
+        di = dirs[idx]
+        if di == -2:
+            continue
+        y, x = divmod(idx, GRID_SIZE)
+        pi = par[idx]
+        reach[(x, y)] = (None if pi < 0 else (pi % GRID_SIZE, pi // GRID_SIZE),
+                         cost[idx], di)
     return reach
 
 
@@ -1349,6 +1412,43 @@ def path_from(reach, target):
         cur = reach[cur][0]
     path.reverse()
     return path
+
+
+def smooth_next(g, rx, ry, path):
+    """path 를 따라가되, 직선으로 안전하게 갈 수 있는 가장 먼 칸을 고른다.
+    반환: (nx, ny) - 이번 스텝의 목표 칸.
+
+    [왜 필요한가] A* 는 MOVES_16 의 정수 오프셋만 내므로 한 칸(또는 나이트
+    이동 2칸)씩 끊어서 간다. 그런데 이 로봇은 회전이 매우 비싸다 - 45도
+    회전(ROBOT_TURN_DPS=75 -> 0.6초)이 직진 1.8칸(0.33초/칸)보다 오래
+    걸린다. 직선 구간을 한 번에 가면 중간의 자잘한 방향 전환이 사라진다.
+
+    ★ 병합해도 끝점은 path 안의 칸(정수)이라 기존 불변식을 안 건드린다:
+      (robot_x, robot_y) == home 비교도, bfs_from 의 배열 인덱싱도 그대로다.
+      달라지는 건 스텝 길이와 헤딩뿐인데, 헤딩은 turn_body_to_reach 가
+      이미 임의 실수각을 처리한다(조준용으로 원래 그렇게 쓰고 있다).
+
+    [탐욕 방향] 가까운 쪽부터 늘려가며 첫 실패에서 멈춘다. segment_safe 가
+    거리에 대해 단조롭다는 보장이 없어서(멀리는 안전한데 중간이 위험할 수
+    있다), 멀리서부터 내려오면 그 구멍을 밟을 수 있다.
+
+    [안전맵] bfs_from 과 같은 planning_grid(strict=True) 기준으로 본다.
+    bfs_from 이 strict 로 못 풀어 완화 모드로 경로를 냈다면 여기서는 병합이
+    안 되고 path[0] 이 그대로 나온다 - 스무딩이 플래너보다 관대해지는 일은
+    없다(항상 보수적인 쪽으로만 어긋난다).
+    """
+    if SMOOTH_MAX_MM <= 0 or len(path) < 2:
+        return path[0]
+    limit = SMOOTH_MAX_MM / (CELL_SIZE_M * 1000.0)
+    smap = compute_safe_map(planning_grid(g, strict=True))
+    best = path[0]
+    for tx, ty in path[1:]:
+        if math.hypot(tx - rx, ty - ry) > limit:
+            break
+        if not segment_safe(g, rx, ry, tx, ty, safe_map=smap):
+            break
+        best = (tx, ty)
+    return best
 
 
 # =============================================================================
@@ -1848,7 +1948,7 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
         moved_last_step = False
         if path:
             prev_x, prev_y = robot_x, robot_y
-            nxt_x, nxt_y = path[0]
+            nxt_x, nxt_y = smooth_next(grid, robot_x, robot_y, path)
             hits = bump_cells(prev_x, prev_y, nxt_x, nxt_y)
             if hits:
                 collisions += 1
@@ -2117,6 +2217,8 @@ def main():
     ap.add_argument('--cone-trim-deg', type=float, default=None)
     ap.add_argument('--no-cone-model', action='store_true')
     ap.add_argument('--cone-subrays', type=int, default=None)
+    ap.add_argument('--smooth-max-mm', type=float, default=None,
+                    help='웨이포인트 병합 최대 직선거리(mm). 0 이면 스무딩 끔')
     args = ap.parse_args()
 
     if args.no_confirm:
@@ -2137,6 +2239,8 @@ def main():
         globals()['SAFE_BLOCK_ESTIMATED'] = False
     if args.turn_cost is not None:
         globals()['TURN_COST'] = args.turn_cost
+    if args.smooth_max_mm is not None:
+        globals()['SMOOTH_MAX_MM'] = args.smooth_max_mm
     if args.false_hit is not None:
         globals()['SENSOR_FALSE_HIT'] = args.false_hit
     if args.miss is not None:
