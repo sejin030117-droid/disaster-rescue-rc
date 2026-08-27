@@ -3,3 +3,10 @@ __pycache__/
 detection_log_*.csv
 width_log_*.csv
 .ua/
+
+# BT+TCP 동시통신 검증용 임시 스케치 - 실물 확인 끝나면 삭제될 스크래치.
+# 실제 펌웨어(rescue_sensor_node/, 이동제어)는 여기 해당 안 됨 - 계속 추적.
+/bt_tcp_coexist_test/
+
+# 서보+ToF 독립 검증용 임시 스케치(WiFi/BT 없음) - 동상.
+/servo_tof_test/

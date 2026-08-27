@@ -1,4 +1,22 @@
 #	모터 명령 송신 — 포트 8890 소켓 (send_command 자리)
+#
+# ★ 2026-08-27 프로토콜 갱신: 실제 이동제어 펌웨어(main_base.ino)를 대조한
+#   결과가 아래 두 함수에 반영돼 있다.
+#     - move_forward(mm): 여전히 duration_ms 방식(펌웨어에 거리 개념이
+#       없음 - CLAUDE.md "⑤ 거리 개념이 아예 없다" 참고). 계수는 이제
+#       robot_config 에서만 가져온다(단일출처) - 여기 숫자를 또 안 고쳐도
+#       실측 후 robot_config 한 곳만 고치면 끝난다.
+#     - turn_left/turn_right(deg): ★펌웨어가 duration_ms 를 안 본다.
+#       자이로(MPU6050 DMP) 폐루프로 고정 90도만 돈다 - deg 인자는 지금
+#       무시된다(호출부 호환을 위해 시그니처만 유지). 회전이 이제
+#       "시간 명령"이 아니라 "완료할 때까지 알아서" 인 상태 명령이라
+#       duration_ms 계산 자체가 의미가 없어졌다.
+#   ★부작용: 경로 스무딩(SMOOTH_MAX_MM)이 만드는 임의 각도(18.43도 등)
+#     회전은 실물에서 전부 90도로 잘린다 - 이건 이 파일이 아니라
+#     main_base.ino 의 한계다(파이썬을 어떻게 고쳐도 안 없어짐). 임의
+#     각도가 필요해지면 .ino 의 LEFT_TURN_ANGLE/RIGHT_TURN_ANGLE 을
+#     함수 인자로 바꿔야 한다 - 지금은 "원본 변수 안 건드림" 방침으로
+#     보류 중.
 import socket
 import json
 
@@ -45,19 +63,29 @@ def send_command(command):
         _client_socket = None
 
 def move_forward(distance_mm=250):
-    duration_ms = int(distance_mm * 4)  # 임시 계산식, 나중에 실측값으로 조정
+    # K, C 는 robot_config 가 단일 출처 - 여기 숫자를 직접 안 고친다.
+    # 둘 다 아직 TODO(미실측) 이라 지금은 이전과 같은 값(K=4, C=0)이지만,
+    # 실측 후엔 robot_config 한 곳만 고치면 이 함수도 자동으로 맞다.
+    duration_ms = int(distance_mm * C.MS_PER_MM + C.MOVE_ACCEL_MS)
     send_command({"cmd": "forward", "speed": 100, "duration_ms": duration_ms})
 
 def turn_left(angle_deg=10):
-    duration_ms = int(abs(angle_deg) * 10)
-    send_command({"cmd": "turn_left", "speed": 100, "duration_ms": duration_ms})
+    # ★angle_deg 는 지금 무시된다 - main_base.ino 가 duration_ms 를 안 보고
+    # 자이로 폐루프로 고정 90도만 돈다(위 파일 상단 주석 참고). 시그니처는
+    # 기존 호출부 호환을 위해 유지.
+    send_command({"cmd": "turn_left"})
 
 def turn_right(angle_deg=10):
-    duration_ms = int(abs(angle_deg) * 10)
-    send_command({"cmd": "turn_right", "speed": 100, "duration_ms": duration_ms})
+    # ★turn_left 와 동일 - angle_deg 무시, 고정 90도.
+    send_command({"cmd": "turn_right"})
 
 def stop():
     send_command({"cmd": "stop"})
+
+def ping():
+    """연결 확인용. ESP32 가 살아있으면 {"type":"pong"} 이 온다(응답은
+    이 소켓에서 직접 안 읽는다 - 필요하면 호출부에서 recv)."""
+    send_command({"cmd": "ping"})
 
 def close_connection():
     global _client_socket

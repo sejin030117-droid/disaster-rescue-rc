@@ -21,7 +21,7 @@ import robot_config as C
 class Esp32Receiver:
     """9999 포트에서 ESP32 스트림을 받아 aim 응답을 id 로 매칭해준다."""
 
-    def __init__(self, port=None, verbose=False):
+    def __init__(self, port=None, verbose=False, on_message=None):
         self.port = port or C.STREAM_PORT
         self.verbose = verbose
         self._server = None
@@ -32,6 +32,12 @@ class Esp32Receiver:
         self._cv = threading.Condition(self._lock)
         self.running = True
         self.stat = {"lines": 0, "aim": 0, "stream": 0, "errors": 0}
+        # ★신규 - 파싱된 메시지마다(type 무관하게) 그대로 넘겨주는 훅.
+        #   stream 타입은 원래 stat 만 올리고 페이로드를 버렸다(map_2d.py
+        #   가 없었던 시절엔 받아갈 곳이 없었으니까). 기존 wait_aim()/stat
+        #   경로는 하나도 안 건드렸다 - camera_test.py 등 기존 사용자는
+        #   영향 없음. 콜백에서 예외가 나도 수신 스레드는 안 죽는다.
+        self.on_message = on_message
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
@@ -82,6 +88,14 @@ class Esp32Receiver:
         except Exception:
             self.stat["errors"] += 1
             return
+
+        if self.on_message is not None:
+            try:
+                self.on_message(msg)
+            except Exception as e:                    # noqa: BLE001
+                if self.verbose:
+                    print(f"[Esp32Receiver] on_message 콜백 오류(무시): {e}")
+
         t = msg.get("type")
         if t == "aim":
             self.stat["aim"] += 1

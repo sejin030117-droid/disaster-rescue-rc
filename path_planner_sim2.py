@@ -93,8 +93,13 @@ from path_planner import (GRID_SIZE, ROBOT_WIDTH_CELLS, find_frontiers,
 
 SCAN_RANGE = 36          # robot_config.DIST_MAX_MM(1800) / CELL_SIZE(50mm)
 
-SERVO_MAX_OFF = 65.0     # 중심(헤딩) 기준 좌우 최대 오프셋 (robot_config 서보범위)
-CAMERA_FOV = 2 * SERVO_MAX_OFF   # 130. 1회 스윕 커버리지
+SERVO_MAX_OFF = 80.0     # 중심(헤딩) 기준 좌우 최대 오프셋
+# ★2026-08-26엔 65였다 - robot_config.ESP32_SERVO_MAX_OFF/rescue_sensor_node
+#   .ino 의 SWEEP_MAX_OFF 는 이미 80 이었는데 여기만 따로 놀고 있었다
+#   (CLAUDE.md "★시뮬과 실기의 속도 상수가 다르다" 절 참고). 2026-08-27
+#   실물 SG90 테스트로 80(물리 서보각 10~170도, 양쪽 10도 여유)을
+#   확정하면서 세 곳을 맞췄다 - 배선(=상수) 문제였지 실측 문제가 아니었다.
+CAMERA_FOV = 2 * SERVO_MAX_OFF   # 160. 1회 스윕 커버리지
 SCAN_COUNT = 30          # 한 번의 FOV 스캔에서 쏘는 광선 개수
 
 LIMIT_SCAN_TO_SERVO = True
@@ -183,7 +188,23 @@ TURN_COST = 1.2
 # 실제로는 직선으로 질러갈 수 있는 구간이 많다 - 병합하면 회전 횟수와 스텝
 # 수가 줄어든다(smooth_next 참고). 0 이면 스무딩을 끈다(= 기존 동작).
 # ★보수적으로 잡을 것: 시뮬은 포즈가 곧 진실이라 실물보다 좋아 보인다.
-SMOOTH_MAX_MM = 200.0
+SMOOTH_MAX_MM = 150.0
+
+# 이동/회전 '중'에도 화면을 갱신할지. sweep_during() 이 센싱용으로 이미
+# 계산하고 있는 보간 포즈를 화면에도 흘려보내는 것뿐이라, 새로 계산하는
+# 값은 없다. 끄면(False) 예전처럼 스텝이 끝날 때만 갱신한다.
+# ★스무딩을 켜면 스텝당 이동거리가 커져서(695->426 스텝) 로봇이 화면에서
+#   순간이동하는 게 눈에 띈다 - 그걸 메우는 용도다.
+RENDER_DURING_MOVE = True
+# 중간 프레임을 '이동량에 비례'해서 넣는다. 짧은 스텝(50mm)은 그대로 두고
+# 스무딩으로 길어진 스텝(최대 200mm)만 쪼갠다.
+# ★재생 속도가 느려지는 건 의도된 것이다: progress() 가 자체적으로
+#   min_interval(0.08s)까지 sleep 하므로 프레임을 늘리면 그만큼 관람 시간이
+#   길어진다. 대신 재생 속도가 '스텝 수'가 아니라 '실제 이동량'에 비례하게
+#   되어 오히려 더 사실적이다(예전엔 50mm 스텝과 200mm 스텝이 같은 시간).
+RENDER_MM_PER_FRAME = 40.0     # 이 거리마다 한 프레임
+RENDER_DEG_PER_FRAME = 25.0    # 회전은 이 각도마다
+RENDER_MAX_FRAMES = 8          # 한 구간당 상한 (너무 느려지지 않게)
 
 # -----------------------------------------------------------------------------
 # 1-8. 가시선(LoS) 정책
@@ -305,6 +326,13 @@ confirm_gained = 0
 returned = False
 
 robot_x = robot_y = 0
+
+# 이동 중 화면 갱신용(RENDER_DURING_MOVE). run() 이 채우고 sweep_during()
+# 이 읽는다 - viz 가 run() 지역변수라 아래 계층에서 접근할 방법이 없었다.
+_viz = None
+_viz_target = None          # 마지막 목표/프런티어. 이동 중엔 안 바뀌므로 재사용
+_viz_frontiers = ()
+_viz_cleanup = False
 robot_angle = 0.0
 step = 0
 collisions = 0
@@ -754,15 +782,56 @@ def _advance_servo(dt):
     return servo_off
 
 
-def sweep_during(duration_s, pose_at):
+def _render_frames(dist_cells=0.0, turn_deg_=0.0):
+    """이 구간에 넣을 중간 프레임 수. 이동량/회전량에 비례시킨다."""
+    if not RENDER_DURING_MOVE or _viz is None:
+        return 0
+    by_move = dist_cells * CELL_SIZE_M * 1000.0 / RENDER_MM_PER_FRAME
+    by_turn = abs(turn_deg_) / RENDER_DEG_PER_FRAME
+    return min(int(max(by_move, by_turn)), RENDER_MAX_FRAMES)
+
+
+def _render_tick():
+    """이동/회전 중 화면 한 프레임. progress() 가 스스로 속도를 맞춘다."""
+    if _viz is None:
+        return
+    _viz.progress(_viz_target, _viz_frontiers, _viz_cleanup)
+
+
+def sweep_during(duration_s, pose_at, render_frames=0):
     global sim_time
     n = int(duration_s / TOF_PERIOD_S)
+    # 중간 프레임을 구간 전체에 고르게 뿌린다(0 이면 아예 안 그림).
+    render_at = set()
+    if render_frames > 0 and n > 0:
+        render_at = {int(n * (k + 1) / (render_frames + 1))
+                     for k in range(render_frames)}
+    # ★화면용으로 전역 포즈를 잠시 덮어쓰므로 끝나면 반드시 되돌린다.
+    #   되돌리지 않으면 호출부의 '상대 갱신'이 깨진다 - 실제로
+    #   turn_body_to_reach 의 `robot_angle = robot_angle + need` 가 스윕이
+    #   이미 써 둔 최종각에 need 를 또 더해서 회전이 두 배로 먹었다
+    #   (seed 14 에서 221 -> 239 스텝으로 결과가 바뀌었음).
+    #   ★불변식: 화면용 코드는 시뮬레이션 상태를 절대 바꾸지 않는다.
+    _saved = (robot_x, robot_y, robot_angle) if render_at else None
     for i in range(n):
         t = (i + 1) * TOF_PERIOD_S
         prev_dir = servo_dir
         off = _advance_servo(TOF_PERIOD_S)
         x, y, h = pose_at(t)
         angle = h + off
+
+        # ★화면용 보간: 이동/회전 '중'의 포즈를 전역에 반영한다.
+        #   sim_bridge 가 S.robot_x/robot_y/robot_angle 을 직접 읽으므로
+        #   이것만으로 대시보드에 부드럽게 그려진다.
+        #   불변식은 안 깨진다 - (robot_x,robot_y)==home 비교도 bfs_from 의
+        #   배열 인덱싱도 전부 '스텝 경계'에서만 일어나는데, 그 시점엔
+        #   호출부가 최종 정수값을 다시 대입한 뒤다.
+        if i in render_at:
+            globals()['robot_x'] = x
+            globals()['robot_y'] = y
+            globals()['robot_angle'] = h
+            _render_tick()
+
         hit_cell, dist = real_scan(grid, x, y, angle)
 
         if USE_CONE_TRIM:
@@ -771,6 +840,9 @@ def sweep_during(duration_s, pose_at):
                 _flush_sweep_buffer(end_is_limit=True)
         elif hit_cell is not None:
             record_hit(hit_cell, angle, dist, x, y)
+    if _saved is not None:
+        (globals()['robot_x'], globals()['robot_y'],
+         globals()['robot_angle']) = _saved
     sim_time += duration_s
 
 
@@ -778,7 +850,8 @@ def sweep_while_turning(x, y, a0, delta_deg):
     dur = abs(delta_deg) / ROBOT_TURN_DPS
     if dur <= 0:
         return
-    sweep_during(dur, lambda t: (x, y, a0 + delta_deg * (t / dur)))
+    sweep_during(dur, lambda t: (x, y, a0 + delta_deg * (t / dur)),
+                 render_frames=_render_frames(turn_deg_=delta_deg))
 
 
 def sweep_while_moving(x0, y0, x1, y1, heading):
@@ -788,7 +861,8 @@ def sweep_while_moving(x0, y0, x1, y1, heading):
         return
     sweep_during(dur, lambda t: (x0 + (x1 - x0) * (t / dur),
                                  y0 + (y1 - y0) * (t / dur),
-                                 heading))
+                                 heading),
+                 render_frames=_render_frames(dist_cells=dist_cells))
     return dur
 
 
@@ -1699,6 +1773,7 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
 
     reset_world(seed)
     viz = _Viz(seed) if visualize else None
+    globals()['_viz'] = viz
 
     committed = None
     commit_steps = 0
@@ -1978,6 +2053,9 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
                 moved_last_step = True
 
         if viz:
+            globals()['_viz_target'] = target
+            globals()['_viz_frontiers'] = frontiers
+            globals()['_viz_cleanup'] = phase != "explore"
             viz.progress(target, frontiers, phase != "explore")
 
     if USE_CONE_TRIM:
@@ -2002,6 +2080,7 @@ def run(seed, visualize=True, verbose=True, pause=0.05):
               f"| 실물 {result['sim_time_s']/60:.1f}분")
     if viz:
         viz.final()
+    globals()['_viz'] = None
     return result
 
 
